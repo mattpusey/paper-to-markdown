@@ -1,0 +1,831 @@
+#!/usr/bin/env python3
+"""
+paper2md.py — deterministic LaTeX -> Markdown converter for LLM-readable output.
+
+Does the mechanical 90% and refuses to guess the rest: anything requiring
+judgement is written to a flag manifest for a human (or an LLM) to resolve.
+
+Design rules
+------------
+1. Prose is PASS-THROUGH. It is never retyped, so it cannot be silently dropped.
+2. Math is extracted to placeholders BEFORE any text-level markup conversion,
+   and restored afterwards. This guarantees one escaping regime: every LaTeX
+   command and every underscore ends up inside $...$, a $$ block, or a fence.
+3. Numbering comes from the .aux file, the bibliography from the .bbl file.
+   No counter reimplementation, no PDF scraping, no staleness window.
+4. Anything ambiguous is FLAGGED, not guessed.
+
+Usage
+-----
+    python3 paper2md.py paper.tex -o paper.md \
+        [--aux paper.aux] [--bbl paper.bbl] \
+        [--styles sv=selected,mv=latent,rv=visible] \
+        [--drop-color]
+
+Outputs paper.md and paper.flags.json, and prints a summary.
+"""
+
+import argparse, json, os, re, sys
+from collections import OrderedDict
+
+# --------------------------------------------------------------------------
+# flags
+# --------------------------------------------------------------------------
+
+FLAGS = []
+
+def flag(kind, detail, snippet="", line=None):
+    FLAGS.append({"kind": kind, "detail": detail,
+                  "snippet": snippet[:400], "line": line})
+
+# --------------------------------------------------------------------------
+# brace matching
+# --------------------------------------------------------------------------
+
+def balanced(s, i, open_ch="{", close_ch="}"):
+    """s[i] must be open_ch. Return (content, index_after_close)."""
+    if i >= len(s) or s[i] != open_ch:
+        return None, i
+    depth, j = 0, i
+    while j < len(s):
+        c = s[j]
+        if c == "\\":
+            j += 2
+            continue
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return s[i + 1:j], j + 1
+        j += 1
+    return None, i
+
+def grab_args(s, i, n):
+    """Grab n balanced {..} groups starting at s[i] (skipping whitespace)."""
+    args = []
+    for _ in range(n):
+        while i < len(s) and s[i] in " \t\n":
+            i += 1
+        content, ni = balanced(s, i)
+        if content is None:
+            return None, i
+        args.append(content)
+        i = ni
+    return args, i
+
+def strip_comments(s):
+    out, i = [], 0
+    while i < len(s):
+        c = s[i]
+        if c == "\\" and i + 1 < len(s):
+            out.append(s[i:i + 2]); i += 2; continue
+        if c == "%":
+            j = s.find("\n", i)
+            if j == -1: break
+            i = j + 1
+            # a comment consumes the newline plus leading whitespace (TeX rule)
+            while i < len(s) and s[i] in " \t":
+                i += 1
+            out.append("\n")
+            continue
+        out.append(c); i += 1
+    return "".join(out)
+
+# --------------------------------------------------------------------------
+# preamble harvesting
+# --------------------------------------------------------------------------
+
+BUILTIN_MACROS = {
+    # braket
+    r"\ket": (1, r"|#1\rangle"),
+    r"\bra": (1, r"\langle #1|"),
+    r"\braket": (1, r"\langle #1\rangle"),
+    # mathtools noise that carries no meaning
+    r"\smashoperator": (1, r"#1"),
+    r"\mathrlap": (1, r"#1"),
+    r"\mathllap": (1, r"#1"),
+}
+
+class Preamble:
+    def __init__(self, text):
+        self.raw = text
+        self.macros = OrderedDict()      # name -> (nargs, body)
+        self.tikz_styles = OrderedDict() # name -> style body
+        self.theorems = OrderedDict()    # env -> display name
+        self.title = None
+        self.authors = []
+        self.affils = []
+        self._harvest()
+
+    def _harvest(self):
+        s = self.raw
+        # \newcommand / \renewcommand / \providecommand
+        for m in re.finditer(r"\\(?:new|renew|provide)command\s*\*?\s*(\{\\(\w+)\}|\\(\w+))", s):
+            name = "\\" + (m.group(2) or m.group(3))
+            i = m.end()
+            nargs, default = 0, None
+            while i < len(s) and s[i] in " \t\n":
+                i += 1
+            if i < len(s) and s[i] == "[":
+                j = s.find("]", i)
+                try: nargs = int(s[i + 1:j])
+                except ValueError: nargs = 0
+                i = j + 1
+                while i < len(s) and s[i] in " \t\n":
+                    i += 1
+                if i < len(s) and s[i] == "[":     # optional-arg default
+                    default, i = balanced(s, i, "[", "]")
+            body, _ = balanced(s, i)
+            if body is None:
+                continue
+            if default is not None:
+                flag("macro-optional-arg",
+                     f"{name} has an optional argument; expansion skipped",
+                     m.group(0))
+                continue
+            # A macro whose body contains $ switches math mode internally. Expanding
+            # it inside an existing $...$ produces nested delimiters and destroys the
+            # escaping regime, so refuse and ask for an explicit replacement.
+            if re.search(r"(?<!\\)\$", body):
+                flag("macro-mode-switching",
+                     f"{name} body contains '$' (switches math mode): {body.strip()} — "
+                     f"not expanded. Supply one with "
+                     f"--macro-override {name.lstrip(chr(92))}='<replacement>'",
+                     m.group(0))
+                continue
+            self.macros[name] = (nargs, body)
+
+        # \DeclareMathOperator
+        for m in re.finditer(r"\\DeclareMathOperator\s*\*?\s*\{\\(\w+)\}\s*", s):
+            body, _ = balanced(s, m.end())
+            if body is not None:
+                self.macros["\\" + m.group(1)] = (0, r"\operatorname{%s}" % body)
+
+        # \NewDocumentCommand — only all-mandatory signatures are safe
+        for m in re.finditer(r"\\(?:New|Renew|Provide)DocumentCommand\s*\{?\\(\w+)\}?\s*", s):
+            sig, i = balanced(s, m.end())
+            if sig is None:
+                continue
+            body, _ = balanced(s, i)
+            name = "\\" + m.group(1)
+            sig_clean = sig.replace(" ", "")
+            if body is not None and set(sig_clean) <= {"m"}:
+                self.macros[name] = (len(sig_clean), body)
+            else:
+                flag("macro-complex-signature",
+                     f"{name} has signature '{sig}' (optional/starred); expansion skipped",
+                     m.group(0))
+
+        # \tikzset{name/.style={...}}
+        for m in re.finditer(r"([A-Za-z][\w]*)\s*/\.style\s*(?:2 args)?\s*=\s*", s):
+            body, _ = balanced(s, m.end())
+            if body is not None:
+                self.tikz_styles.setdefault(m.group(1), body.strip())
+
+        # \newtheorem{env}{Display}
+        for m in re.finditer(r"\\newtheorem\s*\*?\s*\{(\w+)\}(?:\[\w+\])?\s*\{([^}]*)\}", s):
+            self.theorems[m.group(1)] = m.group(2)
+
+        # title block
+        m = re.search(r"\\title\s*(\{)", s)
+        if m:
+            t, _ = balanced(s, m.end() - 1)
+            if t:
+                self.title = re.sub(r"\\vspace\s*\{[^}]*\}", "", t).strip()
+        for m in re.finditer(r"\\author\s*(?:\[([^\]]*)\])?\s*(\{)", s):
+            a, _ = balanced(s, m.end() - 1)
+            if a: self.authors.append((m.group(1) or "", a.strip()))
+        for m in re.finditer(r"\\affil\s*(?:\[([^\]]*)\])?\s*(\{)", s):
+            a, _ = balanced(s, m.end() - 1)
+            if a: self.affils.append((m.group(1) or "", a.strip()))
+
+# --------------------------------------------------------------------------
+# macro expansion
+# --------------------------------------------------------------------------
+
+def expand_macros(body, macros, max_passes=12):
+    table = dict(BUILTIN_MACROS)
+    table.update(macros)
+    # longest names first so \Qpa is not matched as \Q
+    names = sorted(table, key=len, reverse=True)
+    for _ in range(max_passes):
+        changed = False
+        out, i = [], 0
+        while i < len(body):
+            if body[i] != "\\":
+                out.append(body[i]); i += 1; continue
+            m = re.match(r"\\([A-Za-z@]+)\*?", body[i:])
+            if not m:
+                out.append(body[i:i + 2]); i += 2; continue
+            name = "\\" + m.group(1)
+            if name not in table:
+                out.append(body[i:i + m.end()]); i += m.end(); continue
+            nargs, tmpl = table[name]
+            j = i + m.end()
+            # \smashoperator[r]{...} — drop a bracket option if present
+            while j < len(body) and body[j] in " \t":
+                j += 1
+            if j < len(body) and body[j] == "[":
+                _, j = balanced(body, j, "[", "]")
+            if nargs == 0:
+                repl = tmpl
+                # keep a space if the macro was followed by one (TeX eats it)
+                out.append(repl); i = j; changed = True
+                if i < len(body) and body[i] == " ":
+                    i += 1
+                continue
+            args, nj = grab_args(body, j, nargs)
+            if args is None:
+                out.append(body[i:i + m.end()]); i += m.end(); continue
+            repl = tmpl
+            for k, a in enumerate(args, 1):
+                repl = repl.replace("#%d" % k, a)
+            out.append(repl); i = nj; changed = True
+        body = "".join(out)
+        if not changed:
+            break
+    return body
+
+# --------------------------------------------------------------------------
+# .aux / .bbl
+# --------------------------------------------------------------------------
+
+def parse_aux(path):
+    """label -> printed number, from \\newlabel{key}{{2.2}{7}...}"""
+    labels = {}
+    if not path or not os.path.exists(path):
+        return labels
+    s = open(path, encoding="utf-8", errors="replace").read()
+    for m in re.finditer(r"\\newlabel\s*\{([^}]*)\}\s*\{", s):
+        grp, _ = balanced(s, m.end() - 1)
+        if grp is None:
+            continue
+        inner, _ = balanced(grp, 0)
+        if inner is not None:
+            labels[m.group(1)] = inner.strip()
+    return labels
+
+def parse_bbl(path):
+    """Return (cite_key -> number, [rendered entries in order])."""
+    order, entries = {}, []
+    if not path or not os.path.exists(path):
+        return order, entries
+    s = open(path, encoding="utf-8", errors="replace").read()
+    items = re.split(r"\\bibitem", s)[1:]
+    for n, it in enumerate(items, 1):
+        km = re.search(r"\{([^}]*)\}", it)
+        if not km:
+            continue
+        order[km.group(1)] = n
+        body = it[km.end():]
+        body = re.split(r"\\end\{thebibliography\}", body)[0]
+        body = re.sub(r"\\(?:newblock|BibitemShut|bibinfo|EOS|bibfield|bibnamefont|href)\b", " ", body)
+        body = re.sub(r"\\[a-zA-Z]+\s*", " ", body)
+        body = re.sub(r"[{}]", "", body)
+        body = re.sub(r"\s+", " ", body).strip()
+        entries.append((n, body))
+    return order, entries
+
+# --------------------------------------------------------------------------
+# tikz -> node/edge block
+# --------------------------------------------------------------------------
+
+NODE_RE = re.compile(r"\\node\s*(?:\[([^\]]*)\])?\s*\(([^)]*)\)\s*(?:at\s*\(([^)]*)\))?\s*\{")
+EDGE_RE = re.compile(
+    r"\\(?:draw|path)\s*(?:\[([^\]]*)\])?\s*\(([^)]*)\)\s*"
+    r"(--|to)\s*(?:\[[^\]]*\])?\s*\(([^)]*)\)\s*;")
+SAFE_CMDS = {"node", "draw", "path", "coordinate", "begin", "end", "tikzset", "centering"}
+
+def convert_tikz(src, styles, style_map, fig_id):
+    """Return (block_text, ok) for one tikzpicture body."""
+    nodes, edges = [], []
+    for m in NODE_RE.finditer(src):
+        label, _ = balanced(src, m.end() - 1)
+        stylelist = [x.strip() for x in (m.group(1) or "").split(",") if x.strip()]
+        prim = None
+        for st in stylelist:
+            base = st.split("=")[0].strip()
+            if base in styles or base in style_map:
+                prim = base; break
+        lab = (label or "").strip()
+        lab = re.sub(r"^\$(.*)\$$", r"\1", lab).strip()
+        nodes.append({"name": m.group(2).strip(), "label": lab, "style": prim})
+    for m in EDGE_RE.finditer(src):
+        a, b = m.group(2).strip(), m.group(4).strip()
+        if a.startswith("$") or b.startswith("$"):
+            continue  # computed coordinate, not a real endpoint
+        directed = "->" in (m.group(1) or "")
+        edges.append((a, b, directed))
+
+    # anything we did not consume that looks structural?
+    residue = NODE_RE.sub(" ", src)
+    residue = EDGE_RE.sub(" ", residue)
+    unknown = set(re.findall(r"\\([A-Za-z]+)", residue)) - SAFE_CMDS
+    ok = True
+    if unknown:
+        ok = False
+        flag("tikz-unparsed-commands",
+             f"{fig_id}: unhandled TikZ commands {sorted(unknown)} — check the figure by hand",
+             src)
+    if not nodes:
+        ok = False
+        flag("tikz-no-nodes", f"{fig_id}: no \\node found; probably a plot or picture", src)
+
+    by_style = OrderedDict()
+    for n in nodes:
+        sem = style_map.get(n["style"], None)
+        key = sem or (n["style"] or "unstyled")
+        by_style.setdefault(key, []).append(n)
+        if n["style"] and n["style"] not in style_map:
+            flag("tikz-style-unmapped",
+                 f"{fig_id}: node style '{n['style']}' has no semantic name "
+                 f"(--styles {n['style']}=...); raw definition: "
+                 f"{styles.get(n['style'], '?')}", "")
+
+    name2label = {n["name"]: (n["label"] or n["name"]) for n in nodes}
+    lines = [f"{fig_id}", "Nodes:"]
+    for key, group in by_style.items():
+        labels = ", ".join(n["label"] or n["name"] for n in group)
+        lines.append(f"  {labels}   [{key}]")
+    lines.append("Edges:")
+    for a, b, directed in edges:
+        arrow = "->" if directed else "--"
+        lines.append(f"  {name2label.get(a, a)} {arrow} {name2label.get(b, b)}")
+    return "\n".join(lines), ok
+
+# --------------------------------------------------------------------------
+# main conversion
+# --------------------------------------------------------------------------
+
+MATH_ENVS = ["equation", "multline", "align", "gather", "eqnarray", "displaymath"]
+
+class Converter:
+    def __init__(self, pre, labels, cite_order, args):
+        self.pre, self.labels, self.cite_order, self.args = pre, labels, cite_order, args
+        self.counters = {}
+        self.store = {}
+        self.n = 0
+        self.footnotes = []
+
+    def stash(self, text):
+        self.n += 1
+        key = f"\x00PM{self.n}\x00"
+        # a $$ block must sit alone between blank lines or the checker (and most
+        # renderers) will not recognise it as display math
+        if text.startswith("$$"):
+            text = "\n\n" + text + "\n\n"
+        self.store[key] = text
+        return key
+
+    def restore(self, s):
+        for _ in range(6):
+            changed = False
+            for k, v in self.store.items():
+                if k in s:
+                    s = s.replace(k, v); changed = True
+            if not changed:
+                break
+        return s
+
+    # ---- figures ----
+    def do_figures(self, s):
+        def one(m):
+            body = m.group(0)
+            env = m.group(1)
+            caps = []
+            for cm in re.finditer(r"\\caption\s*\{", body):
+                c, _ = balanced(body, cm.end() - 1)
+                if c: caps.append(c.strip())
+            subcaps = re.findall(r"\\begin\{subfigure\}", body)
+            if subcaps and len(caps) > len(subcaps):
+                cap = caps[-1] + " " + " ".join(
+                    f"({chr(97+i)}) {c}" for i, c in enumerate(caps[:-1]))
+            else:
+                cap = caps[-1] if caps else ""
+            lm = re.search(r"\\label\s*\{([^}]*)\}", body)
+            num = self.labels.get(lm.group(1), "?") if lm else "?"
+            fig_id = f"FIGURE {num}"
+            if re.search(r"\\includegraphics", body):
+                flag("figure-image",
+                     f"{fig_id}: uses \\includegraphics — needs a human/LLM description",
+                     body)
+                block = f"{fig_id} — [IMAGE: needs description]"
+                parts = [f"```\n{block}\n```"]
+            else:
+                pics = re.findall(r"\\begin\{tikzpicture\}(.*?)\\end\{tikzpicture\}",
+                                  body, re.S)
+                parts = []
+                for i, p in enumerate(pics):
+                    sub = fig_id + (f"({chr(97+i)})" if len(pics) > 1 else "")
+                    blk, _ = convert_tikz(p, self.pre.tikz_styles,
+                                          self.args.style_map, sub)
+                    parts.append(f"```\n{blk}\n```")
+                if not pics:
+                    flag("figure-unknown", f"{fig_id}: no tikzpicture and no image", body)
+            cap_md = f"\n**Figure {num}:** {cap}\n" if cap else ""
+            return "\n\n" + "\n\n".join(parts) + "\n" + cap_md + "\n"
+        return re.sub(r"\\begin\{(figure\*?|subfigure)\}.*?\\end\{\1\}", one, s, flags=re.S)
+
+    # ---- math ----
+    def do_math(self, s):
+        # display environments
+        for env in MATH_ENVS:
+            pat = re.compile(r"\\begin\{%s(\*?)\}(.*?)\\end\{%s\1\}" % (env, env), re.S)
+            def rep(m, env=env):
+                inner = m.group(2)
+                lm = re.search(r"\\label\s*\{([^}]*)\}", inner)
+                tag = ""
+                if lm:
+                    num = self.labels.get(lm.group(1))
+                    if num: tag = "\n\\tag{%s}" % num
+                    else: flag("equation-unnumbered",
+                               f"no .aux entry for equation label '{lm.group(1)}'", inner)
+                inner = re.sub(r"\\label\s*\{[^}]*\}", "", inner)
+                inner = re.sub(r"\\nonumber", "", inner)
+                if env in ("multline", "gather", "eqnarray", "align"):
+                    inner = "\\begin{aligned}%s\\end{aligned}" % inner
+                return self.stash("$$\n%s%s\n$$" % (inner.strip(), tag))
+            s = pat.sub(rep, s)
+        s = re.sub(r"\\(?:begin|end)\{subequations\}", "", s)
+        # \[ ... \]
+        s = re.sub(r"\\\[(.*?)\\\]", lambda m: self.stash("$$\n%s\n$$" % m.group(1).strip()),
+                   s, flags=re.S)
+        # inline
+        s = re.sub(r"\\\((.*?)\\\)", lambda m: self.stash("$%s$" % m.group(1).strip()),
+                   s, flags=re.S)
+        s = re.sub(r"(?<!\\)\$([^$]+)\$", lambda m: self.stash("$%s$" % m.group(1)), s)
+        return s
+
+    # ---- text markup ----
+    def do_text(self, s):
+        # theorem-like environments
+        for env, disp in list(self.pre.theorems.items()) + [("proof", "Proof")]:
+            pat = re.compile(r"\\begin\{%s\}(\[[^\]]*\])?(.*?)\\end\{%s\}" % (env, env), re.S)
+            def rep(m, env=env, disp=disp):
+                note = (m.group(1) or "").strip("[]")
+                inner = m.group(2)
+                lm = re.search(r"\\label\s*\{([^}]*)\}", inner)
+                num = self.labels.get(lm.group(1), "") if lm else ""
+                if env != "proof":
+                    # LaTeX still prints a number for an unlabelled environment,
+                    # so keep our own counter in step with the .aux ones
+                    self.counters[env] = self.counters.get(env, 0) + 1
+                    if not num:
+                        num = str(self.counters[env])
+                    else:
+                        try: self.counters[env] = int(str(num).split(".")[-1])
+                        except ValueError: pass
+                inner = re.sub(r"\\label\s*\{[^}]*\}", "", inner).strip()
+                if env == "proof":
+                    return "\n\n*Proof.* %s $\\square$\n\n" % inner
+                head = f"**{disp} {num}".strip() + (f" ({note})" if note else "") + ".**"
+                quoted = "\n".join("> " + ln if ln.strip() else ">"
+                                   for ln in (head + " " + inner).split("\n"))
+                return "\n\n" + quoted + "\n\n"
+            s = pat.sub(rep, s)
+
+        # restatable: \begin{restatable}{lemma}{MacroName} body \end{restatable}
+        def restate(m):
+            env, macro, inner = m.group(1), m.group(2), m.group(3)
+            disp = self.pre.theorems.get(env, env.capitalize())
+            lm = re.search(r"\\label\s*\{([^}]*)\}", inner)
+            num = self.labels.get(lm.group(1), "") if lm else ""
+            inner = re.sub(r"\\label\s*\{[^}]*\}", "", inner).strip()
+            self.store.setdefault("__restate__", {})
+            body = f"**{disp} {num}.**".replace(" .", ".") + " " + inner
+            RESTATE[macro] = body
+            quoted = "\n".join("> " + ln if ln.strip() else ">" for ln in body.split("\n"))
+            return "\n\n" + quoted + "\n\n"
+        s = re.sub(r"\\begin\{restatable\}\{(\w+)\}\{(\w+)\}(.*?)\\end\{restatable\}",
+                   restate, s, flags=re.S)
+        # \MacroName*  -> the stored statement
+        def unrestate(m):
+            body = RESTATE.get(m.group(1))
+            if body is None:
+                flag("restate-missing", f"\\{m.group(1)}* has no stored statement", m.group(0))
+                return m.group(0)
+            return "\n\n" + "\n".join("> " + ln if ln.strip() else ">"
+                                      for ln in body.split("\n")) + "\n\n"
+        if RESTATE:
+            s = re.sub(r"\\(" + "|".join(map(re.escape, RESTATE)) + r")\*(?!\w)",
+                       unrestate, s)
+
+        # sections
+        s = re.sub(r"\\section\*?\s*\{", lambda m: "\n\n## ", s)
+        s = re.sub(r"\\subsection\*?\s*\{", lambda m: "\n\n### ", s)
+        s = re.sub(r"\\subsubsection\*?\s*\{", lambda m: "\n\n#### ", s)
+        s = self._close_heading(s)
+
+        # footnotes
+        def fn(m):
+            body, _ = balanced(s2[0], m.end() - 1)
+            return ""
+        out, i = [], 0
+        while True:
+            m = re.search(r"\\footnote\s*\{", s[i:])
+            if not m: out.append(s[i:]); break
+            start = i + m.start()
+            body, after = balanced(s, i + m.end() - 1)
+            out.append(s[i:start])
+            self.footnotes.append(body.strip() if body else "")
+            out.append("[^%d]" % len(self.footnotes))
+            i = after
+        s = "".join(out)
+        if self.footnotes:
+            s += "\n\n" + "\n\n".join("[^%d]: %s" % (i, t)
+                                         for i, t in enumerate(self.footnotes, 1))
+            self.footnotes_spliced = True
+
+        # emphasis / fonts
+        for cmd, wrap in [("emph", "*"), ("textit", "*"), ("textbf", "**"),
+                          ("texttt", "`"), ("textsc", "")]:
+            s = self._wrap(s, cmd, wrap)
+
+        # lists
+        s = re.sub(r"\\begin\{itemize\}", "\n", s)
+        s = re.sub(r"\\end\{itemize\}", "\n", s)
+        s = re.sub(r"\\begin\{enumerate\}", "\n", s)
+        s = re.sub(r"\\end\{enumerate\}", "\n", s)
+        s = re.sub(r"\\item\s+", "\n- ", s)
+
+        # cross-references
+        def ref(m):
+            key = m.group(2)
+            num = self.labels.get(key)
+            if num is None:
+                flag("ref-unresolved",
+                     f"\\{m.group(1)}{{{key}}} — no .aux entry (run with --aux)", m.group(0))
+                return f"[{key}]"
+            return f"({num})" if m.group(1) == "eqref" else num
+        s = re.sub(r"\\(ref|eqref)\s*\{([^}]*)\}", ref, s)
+
+        def cite(m):
+            keys = [k.strip() for k in m.group(2).split(",")]
+            nums = []
+            for k in keys:
+                n = self.cite_order.get(k)
+                if n is None:
+                    flag("cite-unresolved", f"\\cite{{{k}}} — no .bbl entry (run with --bbl)", "")
+                    nums.append(k)
+                else:
+                    nums.append(str(n))
+            if m.group(1) == "citet":
+                flag("citet-manual",
+                     f"\\citet{{{m.group(2)}}} renders author names via the .bst; "
+                     f"emitted as a bare number — check against the PDF", m.group(0))
+            return "[" + ", ".join(nums) + "]"
+        s = re.sub(r"\\(cite[tp]?)\s*(?:\[[^\]]*\])?\s*\{([^}]*)\}", cite, s)
+
+        # tables
+        s = self._tables(s)
+
+        # leftover structural noise
+        s = re.sub(r"\\(?:label|nocite|bibliographystyle|bibliography|maketitle|centering"
+                   r"|setlength|setcounter|addtolength|counterwithin|renewcommand"
+                   r"|vspace|hspace|bigskip|medskip|smallskip|noindent|onecolumn|twocolumn"
+                   r"|appendix|FloatBarrier|center|par)\b\s*(\{[^}]*\}|\[[^\]]*\])?", "", s)
+        s = re.sub(r"\\begin\{(document|strip|abstract|center|subfigure)\}", "", s)
+        s = re.sub(r"\\end\{(document|strip|abstract|center|subfigure)\}", "", s)
+        if self.args.drop_color:
+            s = re.sub(r"\\color\s*\{[^}]*\}", "", s)
+        s = re.sub(r"\\ ", " ", s)          # control-space after a macro
+        s = s.replace("---", "—").replace("~", " ")
+        s = re.sub(r"\n{3,}", "\n\n", s)
+        return s
+
+    def _close_heading(self, s):
+        """Our section replacement left a dangling '{'; close it at the brace."""
+        out, i = [], 0
+        while True:
+            m = re.search(r"\n\n(#{2,4}) ", s[i:])
+            if not m:
+                out.append(s[i:]); break
+            start = i + m.start()
+            out.append(s[i:start + m.end() - m.start()])
+            j = start + (m.end() - m.start())
+            # s[j-1] is the space after the hashes; the '{' was consumed already
+            depth, k = 1, j
+            while k < len(s) and depth:
+                if s[k] == "{": depth += 1
+                elif s[k] == "}": depth -= 1
+                k += 1
+            out.append(s[j:k - 1])
+            i = k
+        return "".join(out)
+
+    def _wrap(self, s, cmd, wrap):
+        out, i = [], 0
+        while True:
+            m = re.search(r"\\%s\s*\{" % cmd, s[i:])
+            if not m:
+                out.append(s[i:]); break
+            start = i + m.start()
+            body, after = balanced(s, i + m.end() - 1)
+            out.append(s[i:start])
+            out.append(f"{wrap}{body}{wrap}" if body else "")
+            i = after
+        return "".join(out)
+
+    def _tables(self, s):
+        def one(m):
+            body = m.group(2)
+            if re.search(r"\\multirow|\\multicolumn", body):
+                flag("table-complex",
+                     "tabular uses multirow/multicolumn — convert by hand", body)
+                return self.stash("```\n[COMPLEX TABLE — see flags]\n```")
+            rows = [r.strip() for r in re.split(r"\\\\", body) if r.strip()]
+            grid = []
+            for r in rows:
+                r = re.sub(r"\\hline|\\toprule|\\midrule|\\bottomrule", "", r).strip()
+                if not r: continue
+                grid.append([c.strip() for c in r.split("&")])
+            if not grid: return ""
+            w = max(len(r) for r in grid)
+            grid = [r + [""] * (w - len(r)) for r in grid]
+            out = ["| " + " | ".join(grid[0]) + " |",
+                   "|" + "---|" * w]
+            for r in grid[1:]:
+                out.append("| " + " | ".join(r) + " |")
+            return self.stash("\n" + "\n".join(out) + "\n")
+        return re.sub(r"\\begin\{tabular\}\{([^}]*)\}(.*?)\\end\{tabular\}",
+                      one, s, flags=re.S)
+
+RESTATE = {}
+
+# --------------------------------------------------------------------------
+# checks
+# --------------------------------------------------------------------------
+
+ACCENTS = "tilde|hat|bar|vec|dot|ddot|widetilde|widehat|overline|check|acute|grave"
+FONTS = "mathcal|mathbb|mathrm|mathtt|mathbf|mathsf|mathfrak|boldsymbol"
+
+def normalise_math(s, overrides):
+    """Fixes LaTeX tolerates but KaTeX/MathJax do not."""
+    # \tilde\mathcal{H} -> \tilde{\mathcal{H}}  (accent needs a braced argument)
+    s = re.sub(r"\\(%s)\s*\\(%s)\s*\{([^{}]*)\}" % (ACCENTS, FONTS),
+               r"\\\1{\\\2{\3}}", s)
+    # \text{<math-only expansion>} -> <expansion>: an override substituted inside
+    # a \text{} wrapper from the source is not valid text mode
+    for rep in overrides:
+        if rep and re.search(r"\\(?:math|operatorname|to|frac|sum|prod)", rep):
+            s = s.replace("\\text{%s}" % rep, rep)
+            s = s.replace("\\text{{%s}}" % rep, rep)
+    return s
+
+def run_checks(md):
+    """Verify the one-escaping-regime property and look for leftovers."""
+    lines = md.split("\n")
+    in_fence = in_disp = False
+    viol = []
+    for i, ln in enumerate(lines, 1):
+        if ln.startswith("```"): in_fence = not in_fence; continue
+        if in_fence: continue
+        if re.match(r"^\$\$\s*$", ln): in_disp = not in_disp; continue
+        if in_disp: continue
+        stripped = re.sub(r"\$[^$]*\$", "", ln)
+        stripped = re.sub(r"\[\^\d+\]:?", "", stripped)
+        if "_" in stripped or re.search(r"\\[A-Za-z]+", stripped):
+            viol.append((i, ln.strip()[:100]))
+    if viol:
+        for i, t in viol[:20]:
+            flag("escaping-regime",
+                 f"line {i}: markdown-visible '_' or bare LaTeX outside math/fence", t, i)
+    return len(viol)
+
+# --------------------------------------------------------------------------
+# main
+# --------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("tex")
+    ap.add_argument("-o", "--out", default=None)
+    ap.add_argument("--aux", default=None)
+    ap.add_argument("--bbl", default=None)
+    ap.add_argument("--styles", default="",
+                    help="comma list mapping tikz styles to semantics, e.g. sv=selected,mv=latent")
+    ap.add_argument("--drop-color", action="store_true",
+                    help="strip \\color{...} revision markup")
+    ap.add_argument("--macro-override", action="append", default=[],
+                    metavar="NAME=REPLACEMENT",
+                    help="force a macro's expansion (used in both modes)")
+    ap.add_argument("--macro-override-text", action="append", default=[],
+                    metavar="NAME=REPLACEMENT",
+                    help="expansion to use OUTSIDE math (e.g. flip='$\\mathtt{ancS}\\to\\mathtt{chM}$')")
+    ap.add_argument("--macro-override-math", action="append", default=[],
+                    metavar="NAME=REPLACEMENT",
+                    help="expansion to use INSIDE math (e.g. flip='\\mathtt{ancS}\\to\\mathtt{chM}')")
+    a = ap.parse_args()
+    a.style_map = dict(p.split("=", 1) for p in a.styles.split(",") if "=" in p)
+
+    src = open(a.tex, encoding="utf-8", errors="replace").read()
+    src = strip_comments(src)
+    if "\\begin{document}" in src:
+        pre_txt, body = src.split("\\begin{document}", 1)
+    else:
+        pre_txt, body = "", src
+    pre = Preamble(pre_txt)
+
+    # auto-locate aux/bbl next to the source
+    stem = os.path.splitext(a.tex)[0]
+    aux = a.aux or (stem + ".aux" if os.path.exists(stem + ".aux") else None)
+    bbl = a.bbl or (stem + ".bbl" if os.path.exists(stem + ".bbl") else None)
+    if not aux:
+        flag("no-aux", "No .aux file: cross-references cannot be numbered. "
+                       "Compile the paper and re-run with --aux.")
+    if not bbl:
+        flag("no-bbl", "No .bbl file: citations cannot be numbered and no reference "
+                       "list will be emitted. Run bibtex and re-run with --bbl.")
+    labels = parse_aux(aux)
+    cite_order, bib_entries = parse_bbl(bbl)
+
+    for st in pre.tikz_styles:
+        if st not in a.style_map:
+            pass  # reported per-use in convert_tikz
+
+    for ov in a.macro_override:
+        if "=" not in ov:
+            continue
+        nm, rep = ov.split("=", 1)
+        pre.macros["\\" + nm.lstrip("\\")] = (0, rep)
+        FLAGS[:] = [f for f in FLAGS
+                    if not (f["kind"] == "macro-mode-switching"
+                            and f["detail"].startswith("\\" + nm.lstrip("\\") + " "))]
+    def apply(ovs, table):
+        for ov in ovs:
+            if "=" in ov:
+                nm, rep = ov.split("=", 1)
+                table["\\" + nm.lstrip("\\")] = (0, rep)
+        return table
+    common = apply(a.macro_override, {})
+    text_macros = dict(pre.macros); text_macros.update(common)
+    math_macros = dict(pre.macros); math_macros.update(common)
+    apply(a.macro_override_text, text_macros)
+    apply(a.macro_override_math, math_macros)
+    resolved = {("\\" + o.split("=")[0].lstrip("\\"))
+                for o in a.macro_override + a.macro_override_text + a.macro_override_math}
+    FLAGS[:] = [f for f in FLAGS
+                if not (f["kind"].startswith("macro-")
+                        and (f["detail"].split()[0] in resolved
+                             or f["detail"].split()[0] not in body))]
+
+    conv = Converter(pre, labels, cite_order, a)
+    body = conv.do_figures(body)
+    body = conv.do_math(body)                      # math -> placeholders
+    for k, v in list(conv.store.items()):          # expand inside math
+        if isinstance(v, str):
+            conv.store[k] = expand_macros(v, math_macros)
+    body = expand_macros(body, text_macros)        # expand outside math
+    body = conv.do_text(body)
+    ovr = [o.split("=", 1)[1] for o in
+           a.macro_override + a.macro_override_text + a.macro_override_math if "=" in o]
+    for k, v in list(conv.store.items()):
+        if isinstance(v, str):
+            conv.store[k] = normalise_math(v, ovr)
+    body = conv.restore(body)
+    # $a$$b$ is ambiguous (reads as a display opener); merge adjacent inline
+    # groups. Display blocks sit alone on their line, so requiring non-newline
+    # on both sides leaves them untouched.
+    body = re.sub(r"(?<=[^\n])\$\$(?=[^\n])", "", body)
+
+    # front matter
+    head = []
+    if pre.title:
+        head.append("# " + pre.title)
+    else:
+        flag("no-title", "No \\title found in the preamble.")
+    if pre.authors:
+        head.append(", ".join(f"**{n}**" + (f"<sup>{k}</sup>" if k else "")
+                              for k, n in pre.authors))
+    for k, v in pre.affils:
+        head.append(f"<sup>{k}</sup> {v}")
+    md = "\n\n".join(head) + "\n\n" + body.strip() + "\n"
+
+    if conv.footnotes and not getattr(conv, "footnotes_spliced", False):
+        md += "\n\n" + "\n\n".join(f"[^{i}]: {t}" for i, t in
+                                   enumerate(conv.footnotes, 1)) + "\n"
+    if bib_entries:
+        md += "\n\n## References\n\n" + "\n\n".join(f"[{n}] {t}" for n, t in bib_entries) + "\n"
+
+    md = re.sub(r"\n{3,}", "\n\n", md)
+    out = a.out or (stem + ".md")
+    open(out, "w", encoding="utf-8").write(md)
+
+    nviol = run_checks(md)
+    fl = out.rsplit(".", 1)[0] + ".flags.json"
+    json.dump(FLAGS, open(fl, "w"), indent=2)
+
+    by_kind = {}
+    for f in FLAGS:
+        by_kind[f["kind"]] = by_kind.get(f["kind"], 0) + 1
+    print(f"wrote {out}  ({len(md)} bytes)")
+    print(f"wrote {fl}  ({len(FLAGS)} flags)")
+    print(f"escaping-regime violations: {nviol}")
+    if by_kind:
+        print("\nflags by kind:")
+        for k, v in sorted(by_kind.items(), key=lambda x: -x[1]):
+            print(f"  {v:4d}  {k}")
+
+if __name__ == "__main__":
+    main()
