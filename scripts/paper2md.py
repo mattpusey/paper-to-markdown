@@ -246,24 +246,26 @@ def expand_macros(body, macros, max_passes=12):
                 out.append(body[i:i + m.end()]); i += m.end(); continue
             nargs, tmpl = table[name]
             j = i + m.end()
-            ws_start = j
+            # TeX discards whitespace after a control word, so the source's own
+            # space is NOT preserved here -- reproducing that is what keeps
+            # "\sel (\D)" rendering as "\mathtt{sel}(\D)" the way LaTeX does.
             # \smashoperator[r]{...} — drop a bracket option if present
             while j < len(body) and body[j] in " \t":
                 j += 1
-            had_ws = j > ws_start  # source had a real space/tab here (TeX eats it)
             if j < len(body) and body[j] == "[":
                 _, j = balanced(body, j, "[", "]")
             if nargs == 0:
                 repl = tmpl
                 out.append(repl)
-                # Reinsert one space when the source had one here, or when none
-                # did but gluing the expansion straight onto what follows would
-                # merge into a different control word (e.g. \ot -> \otimes
-                # directly touching "N" would read as \otimesN). A leading "\\"
-                # or brace/symbol on the far side never needs this: only two
-                # adjacent *letters* actually fuse into one TeX token.
+                # One space is still needed where dropping it would glue the
+                # expansion onto what follows and merge them into a different
+                # control word: \ot -> \otimes touching "N" reads as \otimesN.
+                # This is a text-level artefact only -- TeX substitutes tokens,
+                # so it never needs the space. A "\\", brace or symbol on the far
+                # side is already a token boundary; only two adjacent *letters*
+                # actually fuse.
                 next_is_letter = j < len(body) and body[j].isalpha()
-                if had_ws or (repl[-1:].isalpha() and next_is_letter):
+                if repl[-1:].isalpha() and next_is_letter:
                     out.append(" ")
                 i = j; changed = True
                 continue
