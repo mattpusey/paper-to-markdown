@@ -445,9 +445,18 @@ def parse_bbl(path):
             while j < len(it) and it[j] in " \t\r\n":
                 j += 1
         if j >= len(it) or it[j] != "{":
+            flag("bbl-unparsed-entry",
+                 f"\\bibitem #{n} in {os.path.basename(path)}: no citation key found "
+                 f"(malformed entry, or an unterminated optional label). Any \\cite "
+                 f"of this reference will not resolve, and it will be missing from "
+                 f"the reference list.", it[:300])
             continue
         key, after = balanced(it, j)
         if key is None:
+            flag("bbl-unparsed-entry",
+                 f"\\bibitem #{n} in {os.path.basename(path)}: citation key group is "
+                 f"unterminated. Any \\cite of this reference will not resolve, and it "
+                 f"will be missing from the reference list.", it[:300])
             continue
         order[key] = n
         body = it[after:]
