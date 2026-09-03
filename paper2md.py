@@ -266,24 +266,203 @@ def parse_aux(path):
             labels[m.group(1)] = inner.strip()
     return labels
 
+def _skip_bibitem_label(s, i):
+    """s[i] is '[' starting a \\bibitem optional label, e.g. [{\\citenamefont
+    {Steudel}\\ and\\ \\citenamefont {Ay}(2015)}]. The label commonly contains
+    one or more balanced {...} groups (which may themselves be nested), so a
+    naive scan to the first ']' or first '}' is wrong. Skip whole {...} groups
+    as units and return the index just after the matching ']'."""
+    if i >= len(s) or s[i] != "[":
+        return i
+    j = i + 1
+    while j < len(s):
+        c = s[j]
+        if c == "\\":
+            j += 2
+            continue
+        if c == "{":
+            _, j2 = balanced(s, j)
+            j = j2 if j2 != j else j + 1
+            continue
+        if c == "]":
+            return j + 1
+        j += 1
+    return i  # unterminated; caller will fail the subsequent {key} match
+
+_BIB_DROP_ARGLESS = {"BibitemOpen"}
+_BIB_DROP_1ARG = {"BibitemShut", "EOS"}
+_BIB_UNWRAP_1 = {"bibnamefont", "bibfnamefont", "citenamefont", "natexlab", "translation"}
+_BIB_EMPH_1 = {"emph"}
+_BIB_BOLD_1 = {"textbf"}
+_BIB_DROP_KEEP_2ND = {"bibfield", "bibinfo"}
+_BIB_LINK_2 = {"href", "href@noop", "Eprint", "url"}
+
+def _render_bib_walk(s):
+    """Recursive worker for render_bib_body. Returns raw text with no
+    whitespace normalization, so field-boundary spaces (e.g. the ',\\ '
+    between an apsrev author list and the title that follows it, which sit
+    right at the edge of two different {...} argument groups) survive
+    unharmed through nested calls; only the public wrapper collapses/strips
+    once, over the fully-assembled string."""
+    out = []
+    i, n = 0, len(s)
+    while i < n:
+        c = s[i]
+        if c == "%" and (i == 0 or s[i - 1] != "\\"):
+            # LaTeX line comment: drop to end of line
+            k = s.find("\n", i)
+            i = n if k == -1 else k + 1
+            continue
+        if c == "\\":
+            # command names may contain '@' (\makeatletter is in effect in
+            # .bbl preambles), e.g. \href@noop -- must be matched as one
+            # token, not split into \href + literal "@noop".
+            m = re.match(r"\\([A-Za-z@]+\*?|.)", s[i:], re.S)
+            if not m:
+                i += 1
+                continue
+            name = m.group(1)
+            j = i + m.end()
+            if name in (" ", "\\"):
+                out.append(" ")
+                i = j
+                continue
+            if name in ("%", "&", "_", "#", "{", "}", "~", "$"):
+                out.append(name)
+                i = j
+                continue
+            k = j
+            while k < n and s[k] in " \t\r\n":
+                k += 1
+
+            def take_brace(k):
+                if k < n and s[k] == "{":
+                    return balanced(s, k)
+                return None, k
+
+            if name in _BIB_DROP_ARGLESS:
+                i = j
+                continue
+            if name in _BIB_DROP_1ARG:
+                arg, k2 = take_brace(k)
+                i = k2 if arg is not None else j
+                continue
+            if name in _BIB_UNWRAP_1 or name in _BIB_EMPH_1 or name in _BIB_BOLD_1:
+                arg, k2 = take_brace(k)
+                if arg is None:
+                    i = j
+                    continue
+                inner = _render_bib_walk(arg)
+                if name in _BIB_EMPH_1:
+                    inner = "*" + inner + "*"
+                elif name in _BIB_BOLD_1:
+                    inner = "**" + inner + "**"
+                out.append(inner)
+                i = k2
+                continue
+            if name in _BIB_DROP_KEEP_2ND:
+                arg1, k2 = take_brace(k)
+                if arg1 is None:
+                    i = j
+                    continue
+                k3 = k2
+                while k3 < n and s[k3] in " \t\r\n":
+                    k3 += 1
+                arg2, k4 = take_brace(k3)
+                if arg2 is None:
+                    i = k2
+                    continue
+                out.append(_render_bib_walk(arg2))
+                i = k4
+                continue
+            if name in _BIB_LINK_2:
+                arg1, k2 = take_brace(k)
+                if arg1 is None:
+                    i = j
+                    continue
+                k3 = k2
+                while k3 < n and s[k3] in " \t\r\n":
+                    k3 += 1
+                arg2, k4 = take_brace(k3)
+                if arg2 is None:
+                    # \url{X} form: single arg is both the link text and target
+                    url = arg1.strip()
+                    out.append(f"[{url}]({url})" if url else "")
+                    i = k2
+                    continue
+                text = _render_bib_walk(arg2)
+                url = arg1.strip()
+                out.append(f"[{text}]({url})" if url else text)
+                i = k4
+                continue
+            # unknown command: drop the name; if a brace group follows, keep
+            # its (recursively rendered) content rather than discarding it
+            arg, k2 = take_brace(k)
+            if arg is not None:
+                out.append(_render_bib_walk(arg))
+                i = k2
+            else:
+                i = j
+            continue
+        if c in "{}":
+            i += 1
+            continue
+        if c == "~":
+            out.append(" ")
+            i += 1
+            continue
+        out.append(c)
+        i += 1
+    return "".join(out)
+
+def render_bib_body(s):
+    """Render a .bbl \\bibitem body (apsrev/REVTeX-style \\bibfield/\\bibinfo/
+    \\bibnamefont/\\href markup) to plain text, keeping the actual field
+    content and dropping the semantic-markup scaffolding, rather than the
+    naive 'delete backslash-commands, keep their brace arguments' approach
+    (which leaves literal field names like 'author'/'title'/'journal' and
+    stray '{}' behind as visible text)."""
+    text = _render_bib_walk(s)
+    text = text.replace("``", '"').replace("''", '"')
+    text = re.sub(r"\s+", " ", text).strip()
+    return text
+
 def parse_bbl(path):
     """Return (cite_key -> number, [rendered entries in order])."""
     order, entries = {}, []
     if not path or not os.path.exists(path):
         return order, entries
     s = open(path, encoding="utf-8", errors="replace").read()
-    items = re.split(r"\\bibitem", s)[1:]
+    # (?![A-Za-z]) so this doesn't also split on \bibitemStop / \bibitemNoStop,
+    # which apsrev-style preambles \providecommand before any real \bibitem.
+    items = re.split(r"\\bibitem(?![A-Za-z])", s)[1:]
     for n, it in enumerate(items, 1):
-        km = re.search(r"\{([^}]*)\}", it)
-        if not km:
+        j = 0
+        while j < len(it) and it[j] in " \t\r\n":
+            j += 1
+        if j < len(it) and it[j] == "[":
+            j = _skip_bibitem_label(it, j)
+            while j < len(it) and it[j] in " \t\r\n":
+                j += 1
+        if j >= len(it) or it[j] != "{":
+            flag("bbl-unparsed-entry",
+                 f"\\bibitem #{n} in {os.path.basename(path)}: no citation key found "
+                 f"(malformed entry, or an unterminated optional label). Any \\cite "
+                 f"of this reference will not resolve, and it will be missing from "
+                 f"the reference list.", it[:300])
             continue
-        order[km.group(1)] = n
-        body = it[km.end():]
+        key, after = balanced(it, j)
+        if key is None:
+            flag("bbl-unparsed-entry",
+                 f"\\bibitem #{n} in {os.path.basename(path)}: citation key group is "
+                 f"unterminated. Any \\cite of this reference will not resolve, and it "
+                 f"will be missing from the reference list.", it[:300])
+            continue
+        order[key] = n
+        body = it[after:]
         body = re.split(r"\\end\{thebibliography\}", body)[0]
-        body = re.sub(r"\\(?:newblock|BibitemShut|bibinfo|EOS|bibfield|bibnamefont|href)\b", " ", body)
-        body = re.sub(r"\\[a-zA-Z]+\s*", " ", body)
-        body = re.sub(r"[{}]", "", body)
-        body = re.sub(r"\s+", " ", body).strip()
+        body = re.sub(r"\\newblock\b", " ", body)
+        body = render_bib_body(body)
         entries.append((n, body))
     return order, entries
 
@@ -590,6 +769,7 @@ class Converter:
         if self.args.drop_color:
             s = re.sub(r"\\color\s*\{[^}]*\}", "", s)
         s = re.sub(r"\\ ", " ", s)          # control-space after a macro
+        s = re.sub(r"\\([&%#_{}])", r"\1", s)  # escaped special characters
         s = s.replace("---", "—").replace("~", " ")
         s = re.sub(r"\n{3,}", "\n\n", s)
         return s
