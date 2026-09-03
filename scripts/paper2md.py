@@ -26,7 +26,7 @@ Outputs paper.md and paper.flags.json, and prints a summary.
 """
 
 import argparse, json, os, re, sys
-from collections import OrderedDict
+from collections import OrderedDict, Counter
 
 # --------------------------------------------------------------------------
 # flags
@@ -204,6 +204,29 @@ class Preamble:
 # macro expansion
 # --------------------------------------------------------------------------
 
+_ARG_RE = re.compile(r"#(\d)")
+
+def _substitute_args(tmpl, args):
+    """Fill #1, #2, ... into a macro's template text.
+
+    Real TeX substitutes at the token level, so e.g. \\langle#2 in a
+    \\newcommand body needs no separator: \\langle is already one token, and
+    whatever #2 expands to starts a new one. This function works on TEXT, so
+    it has to add back a space by hand wherever that token boundary would
+    otherwise vanish — i.e. wherever a letter in the template ends up sitting
+    directly against a letter that starts (or ends) the substituted argument.
+    Checks the *template's* neighbouring characters (not the partially-built
+    output), so earlier substitutions can't shift what a later one sees.
+    """
+    def one(m):
+        k = int(m.group(1))
+        a = args[k - 1] if k - 1 < len(args) else ""
+        pre, post = tmpl[:m.start()], tmpl[m.end():]
+        lead = " " if pre and pre[-1].isalpha() and a[:1].isalpha() else ""
+        trail = " " if post and post[0].isalpha() and a[-1:].isalpha() else ""
+        return lead + a + trail
+    return _ARG_RE.sub(one, tmpl)
+
 def expand_macros(body, macros, max_passes=12):
     table = dict(BUILTIN_MACROS)
     table.update(macros)
@@ -223,24 +246,31 @@ def expand_macros(body, macros, max_passes=12):
                 out.append(body[i:i + m.end()]); i += m.end(); continue
             nargs, tmpl = table[name]
             j = i + m.end()
+            ws_start = j
             # \smashoperator[r]{...} — drop a bracket option if present
             while j < len(body) and body[j] in " \t":
                 j += 1
+            had_ws = j > ws_start  # source had a real space/tab here (TeX eats it)
             if j < len(body) and body[j] == "[":
                 _, j = balanced(body, j, "[", "]")
             if nargs == 0:
                 repl = tmpl
-                # keep a space if the macro was followed by one (TeX eats it)
-                out.append(repl); i = j; changed = True
-                if i < len(body) and body[i] == " ":
-                    i += 1
+                out.append(repl)
+                # Reinsert one space when the source had one here, or when none
+                # did but gluing the expansion straight onto what follows would
+                # merge into a different control word (e.g. \ot -> \otimes
+                # directly touching "N" would read as \otimesN). A leading "\\"
+                # or brace/symbol on the far side never needs this: only two
+                # adjacent *letters* actually fuse into one TeX token.
+                next_is_letter = j < len(body) and body[j].isalpha()
+                if had_ws or (repl[-1:].isalpha() and next_is_letter):
+                    out.append(" ")
+                i = j; changed = True
                 continue
             args, nj = grab_args(body, j, nargs)
             if args is None:
                 out.append(body[i:i + m.end()]); i += m.end(); continue
-            repl = tmpl
-            for k, a in enumerate(args, 1):
-                repl = repl.replace("#%d" % k, a)
+            repl = _substitute_args(tmpl, args)
             out.append(repl); i = nj; changed = True
         body = "".join(out)
         if not changed:
@@ -502,6 +532,49 @@ def convert_tikz(src, styles, style_map, fig_id):
     residue = EDGE_RE.sub(" ", residue)
     unknown = set(re.findall(r"\\([A-Za-z]+)", residue)) - SAFE_CMDS
     ok = True
+
+    # A \node name defined more than once in the SAME tikzpicture is a strong
+    # signal that this picture actually contains multiple sub-panels (typically
+    # \begin{scope}[xshift=...]...\end{scope} blocks, one per panel) that reuse
+    # node identifiers panel to panel. TikZ itself allows this — the later
+    # \node silently rebinds the name, and each \draw resolves against whichever
+    # definition came before it — but this extractor collects every \node/\draw
+    # in the whole tikzpicture into one flat list keyed by name, so a reused name
+    # makes the "Nodes:"/"Edges:" output below wrong for every panel: duplicate
+    # entries in the node list, and edges from an earlier panel silently
+    # relabelled with a later panel's node of the same name.
+    name_counts = Counter(n["name"] for n in nodes)
+    dup_names = sorted(name for name, c in name_counts.items() if c > 1)
+    if dup_names:
+        ok = False
+        flag("tikz-duplicate-node-name",
+             f"{fig_id}: node name(s) {dup_names} defined more than once in this "
+             f"tikzpicture. TikZ allows this (each \\draw uses whichever "
+             f"definition precedes it), but it usually means multiple sub-panels "
+             f"share one tikzpicture and reuse node names/labels across panels — "
+             f"the Nodes/Edges list below merges all panels and is unreliable. "
+             f"Split the tikzpicture by \\scope block and rebuild each panel's "
+             f"node/edge list by hand.",
+             src)
+
+    # Even without a reused node NAME, multiple \scope blocks (especially ones
+    # offset with xshift/yshift, the usual way of laying out side-by-side
+    # sub-figures) mean this tikzpicture is likely several logically separate
+    # diagrams sharing one picture. Node IDS can differ per scope while the
+    # DISPLAYED LABELS still repeat (e.g. every panel has its own node happening
+    # to be labelled "$A$"), which this extractor also cannot tell apart from a
+    # single shared diagram — so flag it even when dup_names is empty.
+    scope_count = len(re.findall(r"\\begin\{scope\}", src))
+    if scope_count > 1 and not dup_names:
+        ok = False
+        flag("tikz-multi-scope",
+             f"{fig_id}: {scope_count} \\scope blocks in one tikzpicture, with no "
+             f"reused node names — check by hand whether these are separate panels "
+             f"whose node LABELS repeat (e.g. each panel has its own node shown as "
+             f"\"$A$\"); the flat Nodes/Edges list below concatenates every scope "
+             f"as if it were one diagram.",
+             src)
+
     if unknown:
         ok = False
         flag("tikz-unparsed-commands",
