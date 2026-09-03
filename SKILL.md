@@ -1,6 +1,6 @@
 ---
 name: paper-to-markdown
-description: "Convert an academic paper (LaTeX source, or PDF-only) into clean Markdown an LLM can read accurately: exact text, equations in $…$, semantic structure, figures as node/edge data. Driven by the paper2md.py script (github.com/mattpusey/paper2md), which does the mechanical work and flags what needs judgement. Use when asked to turn a paper, preprint, manuscript or .tex into markdown, or to make a document LLM-readable."
+description: "Convert an academic paper (LaTeX source, or PDF-only) into clean Markdown an LLM can read accurately: exact text, equations in $…$, semantic structure, figures as node/edge data. Driven by the paper2md.py script (github.com/mattpusey/paper-to-markdown), which does the mechanical work and flags what needs judgement. Use when asked to turn a paper, preprint, manuscript or .tex into markdown, or to make a document LLM-readable."
 ---
 
 # Paper → LLM-readable Markdown
@@ -24,7 +24,7 @@ The script should be in the `scripts/` directory of this skill, or it may alread
 
 ```bash
 command -v paper2md.py || ls ./paper2md.py ../paper2md.py 2>/dev/null \
-  || git clone https://github.com/mattpusey/paper2md.git
+  || git clone https://github.com/mattpusey/paper-to-markdown.git
 ```
 
 Entry point is `paper2md.py`, stdlib only. If the repo is unreachable and no local copy exists, the design is specified below well enough to rebuild — but prefer the real thing, which has been tested end to end.
