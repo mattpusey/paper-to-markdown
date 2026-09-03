@@ -20,7 +20,7 @@ One rule if you do go to Markdown: **one escaping regime**. LaTeX math belongs i
 
 ## 1. Get the script
 
-It may already be here — check before cloning:
+The script should be in the `scripts/` directory of this skill, or it may already be somewhere on the system  — check before cloning:
 
 ```bash
 command -v paper2md.py || ls ./paper2md.py ../paper2md.py 2>/dev/null \
