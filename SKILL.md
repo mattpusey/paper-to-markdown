@@ -89,15 +89,25 @@ The script inserts a separating space itself wherever expanding a macro would ot
 
 ## 5. Verify
 
-The script self-checks the escaping regime and reports violations; **zero is the only acceptable number**. Then:
+`paper2md.py` self-checks the escaping regime as it converts; **zero is the only acceptable number**. Everything else is `verify.py`, which also works on output the script never produced — a PDF-only conversion, or a file you hand-edited:
 
 ```bash
-npm install katex js-tiktoken --silent
+npm install katex --silent          # verify.py skips the math check without it
+python3 verify.py paper.md --outline
 ```
 
-- **Every expression parses.** Run each `$$…$$` (strip `\tag{}` first) and each `$…$` through `katex.renderToString` with `throwOnError`. Watch for accents LaTeX tolerates and KaTeX rejects — `\tilde\mathcal{H}` needs to be `\tilde{\mathcal{H}}` — and for `$a$$b$` from adjacent inline groups, which reads as a display-math opener. A leftover `\doibase` inside a `[text](\doibase 10.xxxx/...)` link (from REVTeX's `.bst`, expands to `http://dx.doi.org/`) is a common one on APS papers — rewrite the link target by hand if the override table didn't already catch it.
-- **No content lost.** Word-frequency diff the Markdown prose against the source, both directions. Strip fenced blocks and math from the Markdown side; strip comments, `tikzpicture` bodies, and the *arguments* of `\label`/`\ref`/`\cite`/`\begin` from the `.tex` side, or label names like `main_theorem_classical` masquerade as prose.
-- **Structure is right.** Grep the headings and theorem lead-ins; check the numbering against the PDF and that the appendices survived.
+It runs four checks and exits non-zero if any fails:
+
+- **Every expression parses**, via `katex_check.js`. Watch for accents LaTeX tolerates and KaTeX rejects — `\tilde\mathcal{H}` needs to be `\tilde{\mathcal{H}}` — and for `$a$$b$` from adjacent inline groups, which reads as a display-math opener. A leftover `\doibase` inside a `[text](\doibase 10.xxxx/...)` link (from REVTeX's `.bst`, expands to `http://dx.doi.org/`) is a common one on APS papers — rewrite the link target by hand if the override table didn't already catch it.
+- **Escaping regime**, reusing `paper2md.run_checks` so there is one implementation of the rule.
+- **Equation numbering** — `\tag{}` gaps, duplicates and ordering. Sectioned tags (`2.2`, `A.1`) are reported rather than treated as gaps.
+- **Cross-references** — every `[n]` resolves to a reference entry, every `Fig. n`/`Table n` in the prose has a caption.
+
+`--outline` prints the heading tree; check the numbering against the PDF and that the appendices survived. `--require-math` turns a skipped KaTeX check into a failure, for CI.
+
+Still manual, and the one that catches silent omission:
+
+- **No content lost.** Word-frequency diff the Markdown prose against the source, both directions. Strip fenced blocks and math from the Markdown side; strip comments, `tikzpicture` bodies, and the *arguments* of `\label`/`\ref`/`\cite`/`\begin` from the `.tex` side, or label names like `main_theorem_classical` masquerade as prose. Against a PDF instead of a `.tex`, strip the page markers and running page numbers, and expect PDF line-break hyphenation (`corre-`/`lation`) to show up as a diff on both sides.
 
 A pandoc differential (`pandoc -f latex -t markdown`) is available as a third opinion, but it is largely redundant now that prose is a pass-through: pandoc drops all figures, flattens theorem environments, loses equation and citation numbering, and leaks `\label` names and `\color` markup into the text. Reach for it only when something looks reordered.
 
