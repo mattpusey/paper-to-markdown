@@ -614,10 +614,32 @@ def convert_tikz(src, styles, style_map, fig_id):
 
 MATH_ENVS = ["equation", "multline", "align", "gather", "eqnarray", "displaymath"]
 
+def next_eq_number(prev, in_subequations=False):
+    """The number LaTeX would give the equation after `prev`.
+
+    Handles flat numbering (4 -> 5), \counterwithin sectioning (2.2 -> 2.3)
+    and subequations, where the letter advances inside the block (5a -> 5b)
+    but the parent counter resumes on leaving it (8b -> 9). Returns None when
+    `prev` is None or has no numeric tail -- the caller then flags instead of
+    guessing.
+    """
+    if not prev:
+        return None
+    m = re.match(r"^(.*?)(\d+)([a-zA-Z]?)$", prev)
+    if not m:
+        return None
+    head, num, suffix = m.groups()
+    if in_subequations:
+        if suffix:                                # 5a -> 5b, still inside
+            return head + num + chr(ord(suffix) + 1)
+        return head + str(int(num) + 1) + "a"     # 4 -> 5a, entering
+    return head + str(int(num) + 1)               # 8b -> 9, or 4 -> 5
+
 class Converter:
     def __init__(self, pre, labels, cite_order, args):
         self.pre, self.labels, self.cite_order, self.args = pre, labels, cite_order, args
         self.counters = {}
+        self.eq_last = None      # last equation number emitted, for derivation
         self.store = {}
         self.n = 0
         self.footnotes = []
@@ -683,18 +705,61 @@ class Converter:
 
     # ---- math ----
     def do_math(self, s):
-        # display environments
-        for env in MATH_ENVS:
-            pat = re.compile(r"\\begin\{%s(\*?)\}(.*?)\\end\{%s\1\}" % (env, env), re.S)
-            def rep(m, env=env):
-                inner = m.group(2)
-                lm = re.search(r"\\label\s*\{([^}]*)\}", inner)
+        # Display environments, matched in ONE pass so they are visited in
+        # document order. Looping per environment type would batch all the
+        # \begin{equation}s before any \begin{align}, which makes a sequential
+        # equation counter meaningless.
+        if True:
+            pat = re.compile(r"\\begin\{(%s)(\*?)\}(.*?)\\end\{\1\2\}"
+                             % "|".join(MATH_ENVS), re.S)
+            # Match positions are stable for the duration of one re.sub over
+            # `s`, so an environment can be tested for containment in a
+            # subequations block -- which is what decides 5a -> 5b vs 8b -> 9.
+            sub_spans = [(mm.start(), mm.end()) for mm in re.finditer(
+                r"\\begin\{subequations\}.*?\\end\{subequations\}", s, re.S)]
+            def in_sub(pos):
+                return any(a <= pos < b for a, b in sub_spans)
+            def rep(m):
+                env, starred, inner = m.group(1), m.group(2), m.group(3)
+                labs = re.findall(r"\\label\s*\{([^}]*)\}", inner)
                 tag = ""
-                if lm:
-                    num = self.labels.get(lm.group(1))
-                    if num: tag = "\n\\tag{%s}" % num
-                    else: flag("equation-unnumbered",
-                               f"no .aux entry for equation label '{lm.group(1)}'", inner)
+                if starred:
+                    # \begin{equation*} etc. are unnumbered in LaTeX too
+                    pass
+                elif labs:
+                    num = self.labels.get(labs[0])
+                    if num:
+                        tag = "\n\\tag{%s}" % num
+                        self.eq_last = num
+                    else:
+                        flag("equation-unnumbered",
+                             f"no .aux entry for equation label '{labs[0]}' — "
+                             f"equation emitted without a number", inner)
+                    if len(labs) > 1:
+                        # an align/subequations block carrying several \label's is
+                        # several numbered equations in LaTeX, but becomes one $$
+                        # block here, which can hold only one \tag
+                        others = [(l, self.labels.get(l, "?")) for l in labs[1:]]
+                        self.eq_last = others[-1][1] if others[-1][1] != "?" else self.eq_last
+                        flag("equation-multi-label",
+                             f"block tagged {self.labels.get(labs[0], '?')} also carries "
+                             f"{', '.join('%s=%s' % o for o in others)}; only the first "
+                             f"number is emitted. Split the rows by hand if the extra "
+                             f"numbers are referenced.", inner)
+                else:
+                    prev = self.eq_last
+                    derived = next_eq_number(prev, in_sub(m.start()))
+                    if derived:
+                        tag = "\n\\tag{%s}" % derived
+                        self.eq_last = derived
+                        flag("equation-derived-number",
+                             f"unlabelled {env} numbered {derived}, continuing from {prev}. "
+                             f"It has no \\label, so this is derived rather than read from "
+                             f"the .aux — check it against the PDF.", inner)
+                    else:
+                        flag("equation-unnumbered",
+                             f"unlabelled {env} and no previous number to continue from — "
+                             f"equation emitted without a number", inner)
                 inner = re.sub(r"\\label\s*\{[^}]*\}", "", inner)
                 inner = re.sub(r"\\nonumber", "", inner)
                 if env in ("multline", "gather", "eqnarray", "align"):
