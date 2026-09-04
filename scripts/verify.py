@@ -121,14 +121,18 @@ def check_equations(md):
         ints = [int(t) for t in numeric]
         out["range"] = [min(ints), max(ints)]
         out["ascending"] = ints == sorted(ints)
-        gaps = [n for n in range(min(ints), max(ints) + 1) if n not in set(ints)]
-        out["gaps"] = gaps
-        # a gap is only meaningful when numbering starts at 1; papers that
-        # number per-section legitimately skip in the flat integer view
-        if gaps and not other:
-            ok = False
         if not out["ascending"]:
             ok = False
+        gaps = [n for n in range(min(ints), max(ints) + 1) if n not in set(ints)]
+        if other:
+            # sectioned tags are in play, so a flat-integer gap list says
+            # nothing — carry it as informational rather than reporting a
+            # gap alongside an OK status
+            out["gaps_informational"] = gaps
+        else:
+            out["gaps"] = gaps
+            if gaps:
+                ok = False
     out["status"] = "OK" if ok else "FAIL"
     return out, ok
 
@@ -153,19 +157,52 @@ def check_citations(md):
              "dangling": dangling, "uncited": uncited}, ok)
 
 
+# Float numbers are strings, never ints: \counterwithin (REVTeX and friends)
+# gives "1.1", appendices give "A.1". Comparing as ints silently drops the
+# section part and turns every such reference into a false failure.
+FIG_CAP_RE = re.compile(r"\*\*Figure\s+([\w.]+?):", re.I)
+TAB_CAP_RE = re.compile(r"\*\*Table\s+([\w.]+?):", re.I)
+FIG_REF_RE = re.compile(r"\bFig(?:ure)?s?\.?\s*(\d[\w.]*)", re.I)
+TAB_REF_RE = re.compile(r"\bTables?\s*(\d[\w.]*)", re.I)
+
+
+def _norm_float(tok):
+    """Trim a sentence-final period: 'see Fig. 4.' refers to figure 4."""
+    return tok.strip().rstrip(".")
+
+
+def _resolves(tok, defined):
+    """A reference resolves to a caption, or to its parent if it names a
+    subfigure — 4a -> 4, 1.1b -> 1.1."""
+    t = _norm_float(tok)
+    if t in defined:
+        return True
+    m = re.match(r"^(.+?)[a-zA-Z]$", t)
+    return bool(m and m.group(1) in defined)
+
+
+def count_figure_blocks(md):
+    """Fenced figure encodings, in either emitted form: an explicit ```figure
+    info string, or paper2md.py's bare fence whose first line is 'FIGURE n'."""
+    n = 0
+    for m in re.finditer(r"```([^\n]*)\n(.*?)```", md, re.S):
+        info, first = m.group(1).strip().lower(), m.group(2).lstrip()
+        if info == "figure" or re.match(r"FIGURE\b", first, re.I):
+            n += 1
+    return n
+
+
 def check_floats(md):
     """Figure/table captions, encoded blocks, and references to them."""
     body = prose_only(md)
-    figs = [int(n) for n in re.findall(r"\*\*Figure (\d+):", md)]
-    tabs = [int(n) for n in re.findall(r"\*\*Table (\d+):", md)]
-    blocks = len(re.findall(r"```figure", md))
+    figs = [_norm_float(n) for n in FIG_CAP_RE.findall(md)]
+    tabs = [_norm_float(n) for n in TAB_CAP_RE.findall(md)]
+    blocks = count_figure_blocks(md)
 
-    ref_figs = set(int(n) for n in
-                   re.findall(r"\bFig(?:ure)?s?\.?\s*(\d+)", body))
-    ref_tabs = set(int(n) for n in re.findall(r"\bTables?\s*(\d+)", body))
-
-    missing_f = sorted(ref_figs - set(figs))
-    missing_t = sorted(ref_tabs - set(tabs))
+    missing_f = sorted({_norm_float(n) for n in FIG_REF_RE.findall(body)
+                        if not _resolves(n, set(figs))})
+    missing_t = sorted({_norm_float(n) for n in TAB_REF_RE.findall(body)
+                        if not _resolves(n, set(tabs))})
     ok = not missing_f and not missing_t
 
     return ({"status": "OK" if ok else "FAIL",
@@ -249,6 +286,9 @@ def main():
     print(f"  equation numbering  {q['status']}  ({', '.join(bits)})")
     if q.get("gaps"):
         print(f"      gaps: {q['gaps']}")
+    if q.get("gaps_informational"):
+        print(f"      unused integers (informational — sectioned tags present):"
+              f" {q['gaps_informational']}")
     if q["duplicates"]:
         print(f"      duplicates: {q['duplicates']}")
     if q["sectioned"]:

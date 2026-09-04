@@ -101,7 +101,7 @@ It runs four checks and exits non-zero if any fails:
 - **Every expression parses**, via `katex_check.js`. Watch for accents LaTeX tolerates and KaTeX rejects — `\tilde\mathcal{H}` needs to be `\tilde{\mathcal{H}}` — and for `$a$$b$` from adjacent inline groups, which reads as a display-math opener. A leftover `\doibase` inside a `[text](\doibase 10.xxxx/...)` link (from REVTeX's `.bst`, expands to `http://dx.doi.org/`) is a common one on APS papers — rewrite the link target by hand if the override table didn't already catch it.
 - **Escaping regime**, reusing `paper2md.run_checks` so there is one implementation of the rule.
 - **Equation numbering** — `\tag{}` gaps, duplicates and ordering. Sectioned tags (`2.2`, `A.1`) are reported rather than treated as gaps.
-- **Cross-references** — every `[n]` resolves to a reference entry, every `Fig. n`/`Table n` in the prose has a caption.
+- **Cross-references** — every `[n]` resolves to a reference entry, every `Fig. n`/`Table n` in the prose has a caption. Float numbers are compared as strings, so `\counterwithin` numbering (`Figure 1.1`) and appendix numbering (`A.1`) work; a subfigure reference (`Fig. 4a`) resolves to its parent caption.
 
 `--outline` prints the heading tree; check the numbering against the PDF and that the appendices survived. `--require-math` turns a skipped KaTeX check into a failure, for CI.
 
