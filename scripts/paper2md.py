@@ -11,9 +11,16 @@ Design rules
 2. Math is extracted to placeholders BEFORE any text-level markup conversion,
    and restored afterwards. This guarantees one escaping regime: every LaTeX
    command and every underscore ends up inside $...$, a $$ block, or a fence.
-3. Numbering comes from the .aux file, the bibliography from the .bbl file.
-   No counter reimplementation, no PDF scraping, no staleness window.
-4. Anything ambiguous is FLAGGED, not guessed.
+3. Numbering comes from the .aux file, the bibliography from the .bbl file:
+   no PDF scraping and no staleness window, since both regenerate on every
+   compile. LaTeX's counter machinery is NOT reimplemented -- but where
+   LaTeX numbers something the .aux does not record (an unlabelled equation
+   or theorem), a local counter continues from the last number that WAS
+   read, and the result is flagged as derived rather than passed off as
+   authoritative.
+4. Anything ambiguous is FLAGGED, never silently dropped. Where a value can
+   be derived instead of left missing it is emitted AND flagged, on the
+   grounds that a visible guess beats an invisible hole.
 
 Usage
 -----
