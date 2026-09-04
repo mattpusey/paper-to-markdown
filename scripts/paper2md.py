@@ -938,7 +938,8 @@ def run_checks(md):
         if in_fence: continue
         if re.match(r"^\$\$\s*$", ln): in_disp = not in_disp; continue
         if in_disp: continue
-        stripped = re.sub(r"\$[^$]*\$", "", ln)
+        stripped = re.sub(r"\$\$[^$]*\$\$", "", ln)   # display math on one line
+        stripped = re.sub(r"\$[^$]*\$", "", stripped)
         stripped = re.sub(r"\[\^\d+\]:?", "", stripped)
         if "_" in stripped or re.search(r"\\[A-Za-z]+", stripped):
             viol.append((i, ln.strip()[:100]))

@@ -1,0 +1,108 @@
+#!/usr/bin/env node
+/*
+ * katex_check.js — parse every math expression in a converted Markdown file.
+ *
+ * Called by verify.py; also usable standalone. Emits JSON on stdout:
+ *
+ *   {"display": N, "inline": M, "fences": F, "failures": [...]}
+ *
+ * A failure carries {kind, index, message, excerpt} so the caller can point
+ * at the offending expression without re-deriving it.
+ *
+ * KaTeX is deliberately stricter than LaTeX. The usual offenders:
+ *   - \tilde\mathcal{H}   -> needs \tilde{\mathcal{H}}
+ *   - $a$$b$              -> adjacent inline groups read as a display opener
+ * Both are real defects in the output, not KaTeX being fussy.
+ *
+ * Usage: node katex_check.js paper.md
+ */
+
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+
+// --------------------------------------------------------------------------
+// locate katex: next to this script, or in the caller's cwd (SKILL.md tells
+// you to `npm install katex` wherever you happen to be working)
+// --------------------------------------------------------------------------
+
+function loadKatex() {
+  const tried = [];
+  try { return require('katex'); } catch (e) { tried.push('require("katex")'); }
+  for (const base of [process.cwd(), __dirname, path.join(__dirname, '..')]) {
+    const p = path.join(base, 'node_modules', 'katex');
+    tried.push(p);
+    try { if (fs.existsSync(p)) return require(p); } catch (e) { /* keep looking */ }
+  }
+  process.stdout.write(JSON.stringify({
+    error: 'katex not found',
+    tried: tried,
+    hint: 'npm install katex',
+  }) + '\n');
+  process.exit(3);
+}
+
+const katex = loadKatex();
+
+// --------------------------------------------------------------------------
+// extraction
+// --------------------------------------------------------------------------
+
+const file = process.argv[2];
+if (!file) {
+  process.stdout.write(JSON.stringify({ error: 'no input file' }) + '\n');
+  process.exit(2);
+}
+
+let src = fs.readFileSync(file, 'utf8');
+
+// protect escaped dollars so they never open or close a math span
+src = src.replace(/\\\$/g, '\0ESCDOLLAR\0');
+
+// fenced blocks hold figure encodings, not math
+let fences = 0;
+src = src.replace(/```[\s\S]*?```/g, () => { fences++; return ' \0FENCE\0 '; });
+
+const failures = [];
+
+function check(body, kind, index, displayMode) {
+  // \tag{} is a numbering directive, not part of the expression under test
+  const cleaned = body.replace(/\\tag\{[^}]*\}/g, '').trim();
+  if (!cleaned) return;
+  try {
+    katex.renderToString(cleaned, { throwOnError: true, displayMode: displayMode });
+  } catch (e) {
+    failures.push({
+      kind: kind,
+      index: index,
+      message: String(e.message).split('\n')[0],
+      excerpt: cleaned.length > 200 ? cleaned.slice(0, 200) + '…' : cleaned,
+    });
+  }
+}
+
+let display = 0;
+src = src.replace(/\$\$([\s\S]*?)\$\$/g, (m, body) => {
+  check(body, 'display', ++display, true);
+  return ' \0DISP\0 ';
+});
+
+let inline = 0;
+src = src.replace(/\$([^$\n]+?)\$/g, (m, body) => {
+  check(body, 'inline', ++inline, false);
+  return ' \0INL\0 ';
+});
+
+// any $ still standing is an unbalanced delimiter
+const stray = (src.match(/\$/g) || []).length;
+
+process.stdout.write(JSON.stringify({
+  display: display,
+  inline: inline,
+  fences: fences,
+  stray_dollars: stray,
+  failures: failures,
+}) + '\n');
+
+process.exit(failures.length || stray ? 1 : 0);
