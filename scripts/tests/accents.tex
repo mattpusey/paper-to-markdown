@@ -1,0 +1,19 @@
+% Regression fixture: LaTeX accents in prose, in the title block, and in a
+% bibliography. Compiles with:  pdflatex accents  (the .bbl is hand-written,
+% so no bibtex run is needed).
+\documentclass{article}
+\usepackage{hyperref}
+\title{Accents: Erd\H{o}s, Schr\"{o}dinger and Ala\~{n}\'{o}n}
+\author{Ond\v{r}ej Turek, Zuzana V\'{a}clav\'{i}kov\'{a}}
+\begin{document}
+\maketitle
+
+Erd\H{o}s and Schr\"{o}dinger met Ala\~{n}\'{o}n in G\"ottingen.
+Fran\c{c}ois, \AA ke, and \O rsted wrote \ss{} and na\"ive caf\'e.
+
+A non-breaking space must survive as a space: see Ref.~\cite{schrod}.
+Braceless forms too: G\"odel, Poincar\'e, \c cedilla, \v{r}eka.
+
+\bibliographystyle{plain}
+\bibliography{accents}   % pulls in the hand-written accents.bbl
+\end{document}

@@ -35,6 +35,11 @@ Outputs paper.md and paper.flags.json, and prints a summary.
 import argparse, json, os, re, sys
 from collections import OrderedDict, Counter
 
+try:
+    from pylatexenc.latex2text import LatexNodes2Text
+except ImportError:                                   # pragma: no cover
+    sys.exit("paper2md.py needs pylatexenc (pip install pylatexenc)")
+
 # --------------------------------------------------------------------------
 # flags
 # --------------------------------------------------------------------------
@@ -98,6 +103,99 @@ def strip_comments(s):
             continue
         out.append(c); i += 1
     return "".join(out)
+
+# --------------------------------------------------------------------------
+# accents
+# --------------------------------------------------------------------------
+
+# pylatexenc is used SURGICALLY here: each accent construct is located by
+# regex and only that fragment is handed to LatexNodes2Text. Running
+# latex2text over the whole document is not an option -- it deletes macros it
+# does not know and strips math outright:
+#
+#   latex_to_text(r"\newcommand{\D}{\mathcal{D}}...The graph $\D$ and $\sel(\D)$.")
+#     ->  'The graph  and ().'
+#
+# i.e. it destroys the two things this converter exists to preserve.
+
+_L2T = LatexNodes2Text(math_mode="verbatim", strict_latex_spaces="based-on-source")
+
+# \"{o}, \'e, \v{r}, \c c, \'\i ... -- control-symbol and control-word accents,
+# braced or braceless. The (?![A-Za-z]) after a control-word accent keeps \v
+# from matching inside \vec and \b from matching inside \bar.
+_ACCENT_RE = re.compile(r"""
+    \\ (?: (?P<sym>["'`^~=.])
+         | (?P<word>[uvHtcdbrk])(?![A-Za-z]) )
+    [ \t]*
+    (?: \{ (?P<braced>[^{}]*) \}
+      | \\(?P<dotless>[ij])(?![A-Za-z])
+      | (?P<bare>[A-Za-z]) )
+""", re.X)
+
+# Standalone glyphs. Longest name first, and (?![A-Za-z]) so \o does not fire
+# inside \omega, \l inside \ldots or \i inside \int.
+_GLYPH_RE = re.compile(
+    r"\\(AA|aa|AE|ae|OE|oe|DH|TH|SS|ss|O|o|L|l|i|j)(?![A-Za-z])(\{\})?([ \t]*)")
+
+
+def _fragment_to_text(frag):
+    """Unicode for one accent/glyph fragment, or None if pylatexenc has
+    nothing to offer. None means LEAVE THE SOURCE ALONE: an accent silently
+    replaced by an empty string is exactly the corruption this is fixing,
+    and the untouched command is then caught by run_checks()."""
+    try:
+        out = _L2T.latex_to_text(frag)
+    except Exception:
+        return None
+    return out if out and out != frag else None
+
+
+# The target of a \url/\href is not prose: a "\~" in there is an author
+# writing a literal tilde, and turning it into a combining accent silently
+# breaks the link. Left alone, it stays visible to run_checks() instead.
+_URL_ARG_RE = re.compile(r"\\(?:url|href)(?:@noop)?\s*\{[^{}]*\}")
+
+
+def decode_accents(s):
+    r"""Turn LaTeX accent constructs into the Unicode characters they denote.
+
+    MUST run before the "~" -> non-breaking-space replacement in do_text():
+    that replacement is a plain str.replace, so on \~{n} it eats the tilde and
+    leaves "\ {n}", which is not even valid LaTeX any more.
+    """
+    def accent(m):
+        out = _fragment_to_text(m.group(0))
+        if out is None:
+            flag("accent-unrendered",
+                 f"accent construct {m.group(0)!r} produced no character and was "
+                 f"left as raw LaTeX (\\~{{}} in a URL is the usual case) — "
+                 f"fix it by hand", m.group(0))
+            return m.group(0)
+        return out
+
+    def glyph(m):
+        out = _fragment_to_text("\\" + m.group(1))
+        if out is None:
+            flag("accent-unrendered",
+                 f"glyph command \\{m.group(1)} did not render and was left as raw "
+                 f"LaTeX — fix it by hand", m.group(0))
+            return m.group(0)
+        # TeX discards the whitespace that terminates a control word (\AA ke ->
+        # "Åke"), but an explicit \ss{} terminates it itself, so the space after
+        # THAT is a real one.
+        return out + (m.group(3) if m.group(2) else "")
+
+    def decode(t):
+        return _GLYPH_RE.sub(glyph, _ACCENT_RE.sub(accent, t))
+
+    out, i = [], 0
+    for m in _URL_ARG_RE.finditer(s):
+        out.append(decode(s[i:m.start()]))
+        out.append(m.group(0))
+        i = m.end()
+    out.append(decode(s[i:]))
+    return "".join(out)
+
 
 # --------------------------------------------------------------------------
 # preamble harvesting
@@ -356,6 +454,15 @@ def _render_bib_walk(s):
             # command names may contain '@' (\makeatletter is in effect in
             # .bbl preambles), e.g. \href@noop -- must be matched as one
             # token, not split into \href + literal "@noop".
+            # accents and standalone glyphs, before the generic dispatch: the
+            # unknown-command fallback below would drop \"{o} down to "o".
+            am = _ACCENT_RE.match(s, i) or _GLYPH_RE.match(s, i)
+            if am:
+                dec = decode_accents(am.group(0))
+                if dec != am.group(0):
+                    out.append(dec)
+                    i = am.end()
+                    continue
             m = re.match(r"\\([A-Za-z@]+\*?|.)", s[i:], re.S)
             if not m:
                 i += 1
@@ -460,7 +567,14 @@ def render_bib_body(s):
     content and dropping the semantic-markup scaffolding, rather than the
     naive 'delete backslash-commands, keep their brace arguments' approach
     (which leaves literal field names like 'author'/'title'/'journal' and
-    stray '{}' behind as visible text)."""
+    stray '{}' behind as visible text).
+
+    Accents are resolved by _render_bib_walk itself: its unknown-command
+    fallback ("drop the name, keep the brace argument") turns \\"{o} into a
+    bare "o", silently losing the umlaut — and a bibliography is where
+    accented names actually live. Decoding inside the walk rather than over
+    the whole string keeps \\href/\\url TARGETS out of it, where a literal
+    \\~ is an author writing a tilde rather than an accent."""
     text = _render_bib_walk(s)
     text = text.replace("``", '"').replace("''", '"')
     text = re.sub(r"\s+", " ", text).strip()
@@ -785,6 +899,13 @@ class Converter:
 
     # ---- text markup ----
     def do_text(self, s):
+        # Accents first: they must be resolved before the "~" -> space
+        # replacement at the end of this method, which is a plain str.replace
+        # and would otherwise eat the tilde out of \~{n} and leave "\ {n}".
+        # Math is already stashed as placeholders by now (design rule 2), so
+        # this only ever sees text.
+        s = decode_accents(s)
+
         # theorem-like environments
         for env, disp in list(self.pre.theorems.items()) + [("proof", "Proof")]:
             pat = re.compile(r"\\begin\{%s\}(\[[^\]]*\])?(.*?)\\end\{%s\}" % (env, env), re.S)
@@ -1126,15 +1247,16 @@ def main():
 
     # front matter
     head = []
+    # The title block never passes through do_text(), so decode its accents here.
     if pre.title:
-        head.append("# " + pre.title)
+        head.append("# " + decode_accents(pre.title))
     else:
         flag("no-title", "No \\title found in the preamble.")
     if pre.authors:
-        head.append(", ".join(f"**{n}**" + (f"<sup>{k}</sup>" if k else "")
+        head.append(", ".join(f"**{decode_accents(n)}**" + (f"<sup>{k}</sup>" if k else "")
                               for k, n in pre.authors))
     for k, v in pre.affils:
-        head.append(f"<sup>{k}</sup> {v}")
+        head.append(f"<sup>{k}</sup> {decode_accents(v)}")
     md = "\n\n".join(head) + "\n\n" + body.strip() + "\n"
 
     if conv.footnotes and not getattr(conv, "footnotes_spliced", False):
