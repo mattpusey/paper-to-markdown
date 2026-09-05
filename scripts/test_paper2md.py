@@ -193,5 +193,35 @@ class DollarDisplayMath(unittest.TestCase):
         self.assertEqual([f["kind"] for f in flags if f["kind"] == "escaping-regime"], [])
 
 
+class TableFloats(unittest.TestCase):
+    r"""\begin{table} floats were not handled: the whole float leaked into the
+    Markdown as raw LaTeX and the \caption never became a caption, so every
+    "Table N" in the prose pointed at nothing."""
+
+    def test_drop_cmd_arg_takes_all_the_arguments(self):
+        self.assertEqual(
+            paper2md.drop_cmd_arg(r"a \renewcommand{\arraystretch}{1.7} b", "renewcommand", 2),
+            "a  b")
+        # one-argument form, brace-matched rather than [^}]*
+        self.assertEqual(paper2md.drop_cmd_arg(r"a \label{x{y}z} b", "label"), "a  b")
+
+    def test_end_to_end(self):
+        md, flags = convert("tables")
+        self.assertIn("**Table 1:** Numerical results.", md)
+        self.assertIn("**Table 2:** Grouped rows.", md)
+        # the tabular inside each float still converts
+        self.assertIn("| $3$ | $\\frac{1}{2}$ |", md)
+        self.assertIn("| C | D |", md)
+        # \centering followed by a { ... } group used to swallow the group,
+        # table and all
+        self.assertNotIn("{1.2}", md)
+        self.assertNotIn("\\begin{table}", md)
+        self.assertNotIn("\\caption", md)
+        # unlabelled float still gets LaTeX's number, derived AND flagged
+        self.assertEqual([f["kind"] for f in flags if f["kind"].startswith("table")],
+                         ["table-derived-number"])
+        self.assertEqual([f["kind"] for f in flags if f["kind"] == "escaping-regime"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

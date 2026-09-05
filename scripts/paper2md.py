@@ -162,6 +162,23 @@ def _child_nodelists(node):
     return lists
 
 
+def drop_cmd_arg(s, name, nargs=1):
+    """Remove every \\name{...} from s, arguments included. Brace-matched, so
+    a two-argument command (\\renewcommand{\\arraystretch}{1.7}) loses BOTH --
+    a regex that strips only the first leaves the second behind as text."""
+    out, i = [], 0
+    for m in re.finditer(r"\\%s\s*\*?\s*(?=\{)" % name, s):
+        if m.start() < i:
+            continue
+        args, after = grab_args(s, m.end(), nargs)
+        if args is None:
+            continue
+        out.append(s[i:m.start()])
+        i = after
+    out.append(s[i:])
+    return "".join(out)
+
+
 def env_body(s, node):
     """The source between \\begin{X}<args> and \\end{X}, verbatim."""
     if not node.nodelist:
@@ -929,6 +946,60 @@ class Converter:
             return "\n\n" + "\n\n".join(parts) + "\n" + cap_md + "\n"
         return replace_envs(s, {"figure", "figure*", "subfigure"}, one)
 
+    # ---- table floats ----
+    def do_table_floats(self, s):
+        r"""\begin{table} ... \end{table} -> the float's contents plus a
+        "**Table N:** caption" line.
+
+        Unlike a figure this is NOT a replacement: the tabular inside is left
+        exactly where it is for _tables() to convert during do_text(), and only
+        the float scaffolding (placement option, \caption, \label) is taken
+        out. Before this, the whole float leaked into the Markdown as raw
+        LaTeX and the caption never became one, so every "Table 1" in the prose
+        pointed at nothing.
+        """
+        def one(node, body, _anc):
+            caps = []
+            for cm in re.finditer(r"\\caption\s*\*?\s*\{", body):
+                c, _ = balanced(body, cm.end() - 1)
+                if c:
+                    caps.append(c.strip())
+            cap = caps[-1] if caps else ""
+            if len(caps) > 1:
+                flag("table-multi-caption",
+                     f"table float carries {len(caps)} captions (sub-tables?); only "
+                     f"the last is emitted. Split them by hand.", body)
+            lm = re.search(r"\\label\s*\{([^}]*)\}", body)
+            num = self.labels.get(lm.group(1)) if lm else None
+            if num is None:
+                # LaTeX numbers the table whether or not it is labelled, so
+                # continue our own counter and say the number is derived
+                # rather than leaving the caption unnumbered (design rule 4).
+                self.counters["table"] = self.counters.get("table", 0) + 1
+                num = str(self.counters["table"])
+                why = (f"no .aux entry for table label '{lm.group(1)}'" if lm
+                       else "table float has no \\label")
+                flag("table-derived-number",
+                     f"{why} — numbered {num} by continuing the local counter. "
+                     f"Check it against the PDF.", body)
+            else:
+                try:
+                    self.counters["table"] = int(str(num).split(".")[-1])
+                except ValueError:
+                    pass
+            inner = drop_cmd_arg(drop_cmd_arg(body, "caption"), "label")
+            inner = re.sub(r"^\s*\[[^\]]*\]", "", inner)      # [h!] placement
+            if re.search(r"\\includegraphics", inner):
+                flag("table-image",
+                     f"TABLE {num}: the float holds an \\includegraphics rather than a "
+                     f"tabular — needs a human/LLM transcription of the image", body)
+            elif not env_spans(inner, {"tabular", "tabular*"}):
+                flag("table-unknown",
+                     f"TABLE {num}: table float with no tabular and no image", body)
+            cap_md = f"**Table {num}:** {cap}\n" if cap else ""
+            return "\n\n" + cap_md + "\n" + inner.strip() + "\n\n"
+        return replace_envs(s, {"table", "table*"}, one)
+
     # ---- math ----
     def do_math(self, s):
         # Display environments, visited in ONE walk so they come in document
@@ -1172,15 +1243,32 @@ class Converter:
         # tables
         s = self._tables(s)
 
-        # leftover structural noise
+        # leftover structural noise. The two-argument ones go first and
+        # brace-matched: the regex below strips a single {...} group, which on
+        # \\renewcommand{\\arraystretch}{1.7} left "{1.7}" behind as prose.
+        for cmd in ("renewcommand", "setlength", "addtolength",
+                    "setcounter", "counterwithin"):
+            s = drop_cmd_arg(s, cmd, 2)
+        for cmd in ("label", "nocite", "bibliographystyle", "bibliography",
+                    "vspace", "hspace"):
+            s = drop_cmd_arg(s, cmd, 1)
+        # Whatever is left takes no argument. The single regex this replaced
+        # offered an optional {[^}]*} to ALL of them, so \centering followed by
+        # a brace group swallowed the group -- with a whole table inside it.
         s = re.sub(r"\\(?:label|nocite|bibliographystyle|bibliography|maketitle|centering"
                    r"|setlength|setcounter|addtolength|counterwithin|renewcommand"
                    r"|vspace|hspace|bigskip|medskip|smallskip|noindent|onecolumn|twocolumn"
-                   r"|appendix|FloatBarrier|center|par)\b\s*(\{[^}]*\}|\[[^\]]*\])?", "", s)
+                   r"|appendix|FloatBarrier|center|par)\b\s*\*?\s*(\[[^\]]*\])?", "", s)
         s = re.sub(r"\\begin\{(document|strip|abstract|center|subfigure)\}", "", s)
         s = re.sub(r"\\end\{(document|strip|abstract|center|subfigure)\}", "", s)
         if self.args.drop_color:
             s = re.sub(r"\\color\s*\{[^}]*\}", "", s)
+        # A brace left alone on its own line is LaTeX grouping whose command has
+        # just been stripped: "{\\renewcommand{\\arraystretch}{1.7} ... }" around
+        # a table leaves "{" and "}" as prose. Deliberately only when it is the
+        # whole line, so a surviving \\begin{env} keeps its braces and stays
+        # visible to run_checks() instead of being mangled into \\beginenv.
+        s = re.sub(r"^[ \t]*[{}][ \t]*$", "", s, flags=re.M)
         s = re.sub(r"\\ ", " ", s)          # control-space after a macro
         s = re.sub(r"\\([&%#_{}])", r"\1", s)  # escaped special characters
         s = s.replace("---", "—").replace("~", " ")
@@ -1391,6 +1479,7 @@ def main():
 
     conv = Converter(pre, labels, cite_order, a)
     body = conv.do_figures(body)
+    body = conv.do_table_floats(body)
     body = conv.do_math(body)                      # math -> placeholders
     for k, v in list(conv.store.items()):          # expand inside math
         if isinstance(v, str):

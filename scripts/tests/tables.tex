@@ -1,0 +1,38 @@
+% Regression fixture: \begin{table} floats. They were not handled at all --
+% the whole float leaked into the Markdown as raw LaTeX and the \caption
+% never became one, so every "Table N" in the prose pointed at nothing.
+% tables.aux is committed alongside; regenerate with
+%   pdflatex -interaction=nonstopmode tables
+\documentclass{article}
+\begin{document}
+
+The results are summarised in Table~\ref{tab:results}, and Table~2 repeats
+them with the rows grouped.
+
+\begin{table}[h!]
+\centering
+{\renewcommand{\arraystretch}{1.2}
+\begin{tabular}{|c|c|}
+\hline
+$n$ & $d$ \\
+\hline
+$3$ & $\frac{1}{2}$ \\
+$5$ & $\frac{3}{2}$ \\
+\hline
+\end{tabular}
+}
+\caption{Numerical results.}\label{tab:results}
+\end{table}
+
+An unlabelled float still gets a number from LaTeX, so it gets one here too
+— derived, and flagged as such.
+
+\begin{table}[h]
+\begin{tabular}{cc}
+A & B \\
+C & D \\
+\end{tabular}
+\caption{Grouped rows.}
+\end{table}
+
+\end{document}
