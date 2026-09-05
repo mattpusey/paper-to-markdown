@@ -1,0 +1,32 @@
+{
+  "name": "paper-to-markdown",
+  "version": "0.1.0",
+  "description": "Convert academic papers into accurate, LLM-readable Markdown.",
+  "author": {
+    "name": "Matthew Pusey",
+    "url": "https://github.com/mattpusey"
+  },
+  "homepage": "https://github.com/mattpusey/paper-to-markdown",
+  "repository": "https://github.com/mattpusey/paper-to-markdown",
+  "license": "MIT",
+  "keywords": [
+    "academic-papers",
+    "latex",
+    "markdown",
+    "pdf",
+    "research"
+  ],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "Paper to Markdown",
+    "shortDescription": "Convert papers into LLM-readable Markdown.",
+    "longDescription": "Converts LaTeX or PDF academic papers into verified Markdown with preserved equations, structure, citations, tables, and semantic figure data.",
+    "developerName": "Matthew Pusey",
+    "category": "Productivity",
+    "capabilities": [
+      "Document conversion",
+      "Academic workflows"
+    ],
+    "defaultPrompt": "Convert this academic paper into accurate, LLM-readable Markdown."
+  }
+}

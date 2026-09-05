@@ -18,16 +18,15 @@ Markdown is not always the answer. Before converting, ask what consumes the outp
 
 One rule if you do go to Markdown: **one escaping regime**. LaTeX math belongs in `$…$`, which is a delimiter that stops Markdown cleanly. Undelimited LaTeX (`\begin{theorem}` in a `.md`) is not a hybrid, it is an ambiguity — nothing says whether `*` inside it is emphasis or multiplication, and `X_U` becomes an italics trigger. Pick one regime and hold it.
 
-## 1. Get the script
+## 1. Locate the bundled script
 
-The script should be in the `scripts/` directory of this skill, or it may already be somewhere on the system  — check before cloning:
+The converter is bundled in this skill's `scripts/` directory. Resolve this skill's root path, then set the entry point once:
 
 ```bash
-command -v paper2md.py || ls ./paper2md.py ../paper2md.py 2>/dev/null \
-  || git clone https://github.com/mattpusey/paper-to-markdown.git
+PAPER2MD_SCRIPT="<skill-root>/scripts/paper2md.py"
 ```
 
-Entry point is `paper2md.py`. It needs **pylatexenc** (`pip install pylatexenc`, 2.11 is fine) — the project's only runtime dependency, used for LaTeX structure scanning (nesting-aware `\begin`/`\end` matching, brace matching, comment stripping) and for turning accent constructs into Unicode. Nothing else is needed to convert; verification additionally wants `npm install katex` (step 5) and Node on `PATH`.
+It needs **pylatexenc** (`pip install pylatexenc`, 2.11 is fine) — the project's only runtime dependency, used for LaTeX structure scanning (nesting-aware `\begin`/`\end` matching, brace matching, comment stripping) and for turning accent constructs into Unicode. Nothing else is needed to convert; verification additionally wants `npm install katex` (step 5) and Node on `PATH`.
 
 If the repo is unreachable and no local copy exists, the design is specified below well enough to rebuild — but prefer the real thing, which has been tested end to end (`python3 scripts/test_paper2md.py`).
 
@@ -57,7 +56,7 @@ If you genuinely cannot compile, run without `--aux`/`--bbl`: every reference be
 ## 3. Run it
 
 ```bash
-python3 paper2md.py paper.tex -o paper.md \
+python3 "$PAPER2MD_SCRIPT" paper.tex -o paper.md \
     --aux paper.aux --bbl paper.bbl \
     --styles sv=selected,mv=latent,rv=visible \
     --drop-color
@@ -99,7 +98,7 @@ The script inserts a separating space itself wherever expanding a macro would ot
 
 ```bash
 npm install katex --silent          # verify.py skips the math check without it
-python3 verify.py paper.md --outline
+python3 "$(dirname "$PAPER2MD_SCRIPT")/verify.py" paper.md --outline
 ```
 
 (`paper2md.py` itself only needs `pylatexenc`; KaTeX is a verification-time dependency.)
