@@ -11,6 +11,9 @@ Design rules
 2. Math is extracted to placeholders BEFORE any text-level markup conversion,
    and restored afterwards. This guarantees one escaping regime: every LaTeX
    command and every underscore ends up inside $...$, a $$ block, or a fence.
+   All four delimiter pairs -- $...$, $$...$$, \[...\] and \(...\) -- are
+   found by the same LatexWalker pass, so an unpaired-looking delimiter
+   cannot shift the pairing of everything after it.
 3. Numbering comes from the .aux file, the bibliography from the .bbl file:
    no PDF scraping and no staleness window, since both regenerate on every
    compile. LaTeX's counter machinery is NOT reimplemented -- but where
@@ -21,6 +24,17 @@ Design rules
 4. Anything ambiguous is FLAGGED, never silently dropped. Where a value can
    be derived instead of left missing it is emitted AND flagged, on the
    grounds that a visible guess beats an invisible hole.
+5. Structure is PARSED, not pattern-matched: pylatexenc's LatexWalker does
+   the \begin/\end matching, brace matching and comment stripping, so
+   nesting is seen (a tabular inside a tabular no longer truncates the outer
+   one at the first inner \end{tabular}). pylatexenc also converts accent
+   constructs to Unicode -- but only fragment by fragment. latex2text is
+   never run over the document: it deletes macros it does not know and
+   strips math outright, which would destroy both things rule 1 and rule 2
+   exist to protect. Macro harvesting and expansion stay ours; LatexWalker
+   does not expand \newcommand.
+
+Requires pylatexenc (pip install pylatexenc; 2.11 is fine).
 
 Usage
 -----
@@ -35,6 +49,14 @@ Outputs paper.md and paper.flags.json, and prints a summary.
 import argparse, json, os, re, sys
 from collections import OrderedDict, Counter
 
+try:
+    from pylatexenc.latex2text import LatexNodes2Text
+    from pylatexenc.latexwalker import (LatexWalker, LatexCommentNode,
+                                        LatexEnvironmentNode, LatexGroupNode,
+                                        LatexMathNode)
+except ImportError:                                   # pragma: no cover
+    sys.exit("paper2md.py needs pylatexenc (pip install pylatexenc)")
+
 # --------------------------------------------------------------------------
 # flags
 # --------------------------------------------------------------------------
@@ -46,27 +68,43 @@ def flag(kind, detail, snippet="", line=None):
                   "snippet": snippet[:400], "line": line})
 
 # --------------------------------------------------------------------------
-# brace matching
+# scanning primitives
 # --------------------------------------------------------------------------
+#
+# All structural scanning goes through pylatexenc's LatexWalker. The regexes
+# these replaced could not see nesting: every \begin{X}(.*?)\end{X} stopped at
+# the FIRST inner \end{X}, so a tabular inside a tabular truncated the outer
+# one and dropped every row after it -- silently, which is the one thing this
+# converter is not allowed to do. LatexWalker parses properly and hands back
+# .pos/.len, so the layers above still work on strings and spans.
+#
+# What LatexWalker does NOT do is expand \newcommand; macro harvesting and
+# expansion below stay ours.
+
+def _walker(s):
+    return LatexWalker(s, tolerant_parsing=True)
+
 
 def balanced(s, i, open_ch="{", close_ch="}"):
-    """s[i] must be open_ch. Return (content, index_after_close)."""
+    """s[i] must be open_ch. Return (content, index_after_close).
+
+    Delimiter matching is LatexWalker's, so a brace inside a % comment or a
+    \\verb argument cannot throw the count off.
+    """
     if i >= len(s) or s[i] != open_ch:
         return None, i
-    depth, j = 0, i
-    while j < len(s):
-        c = s[j]
-        if c == "\\":
-            j += 2
-            continue
-        if c == open_ch:
-            depth += 1
-        elif c == close_ch:
-            depth -= 1
-            if depth == 0:
-                return s[i + 1:j], j + 1
-        j += 1
-    return None, i
+    try:
+        w = _walker(s)
+        if open_ch == "{":
+            node, pos, ln = w.get_latex_expression(pos=i)
+        else:
+            node, pos, ln = w.get_latex_maybe_optional_arg(pos=i)
+    except Exception:
+        return None, i
+    if node is None or not isinstance(node, LatexGroupNode) or ln < 2:
+        return None, i
+    return s[pos + 1:pos + ln - 1], pos + ln
+
 
 def grab_args(s, i, n):
     """Grab n balanced {..} groups starting at s[i] (skipping whitespace)."""
@@ -81,23 +119,204 @@ def grab_args(s, i, n):
         i = ni
     return args, i
 
+
 def strip_comments(s):
+    """Drop % comments, reproducing TeX's rule that a comment eats the rest of
+    the line plus the following line's leading whitespace."""
+    try:
+        nodes, _, _ = _walker(s).get_latex_nodes()
+    except Exception:
+        return s
     out, i = [], 0
-    while i < len(s):
-        c = s[i]
-        if c == "\\" and i + 1 < len(s):
-            out.append(s[i:i + 2]); i += 2; continue
-        if c == "%":
-            j = s.find("\n", i)
-            if j == -1: break
-            i = j + 1
-            # a comment consumes the newline plus leading whitespace (TeX rule)
-            while i < len(s) and s[i] in " \t":
-                i += 1
-            out.append("\n")
-            continue
-        out.append(c); i += 1
+    def visit(ns):
+        nonlocal i
+        for n in ns:
+            if isinstance(n, LatexCommentNode):
+                out.append(s[i:n.pos])
+                ps = n.comment_post_space
+                # The comment node spans "%...", its newline and the leading
+                # whitespace of the next line. TeX ends the line and eats that
+                # indentation; anything past it (a blank line, i.e. a paragraph
+                # break) is ordinary text and has to survive.
+                out.append("\n" + ps[1:].lstrip(" \t")
+                           if ps.startswith("\n") else ps)
+                i = n.pos + n.len
+                continue
+            for sub in _child_nodelists(n):
+                visit(sub)
+    visit(nodes)
+    out.append(s[i:])
     return "".join(out)
+
+
+def _child_nodelists(node):
+    """Every child node list hanging off `node` — body, group content and
+    macro/environment arguments alike."""
+    lists = []
+    nl = getattr(node, "nodelist", None)
+    if nl:
+        lists.append(nl)
+    argd = getattr(node, "nodeargd", None)
+    if argd is not None and getattr(argd, "argnlist", None):
+        lists.append([a for a in argd.argnlist if a is not None])
+    return lists
+
+
+def drop_cmd_arg(s, name, nargs=1):
+    """Remove every \\name{...} from s, arguments included. Brace-matched, so
+    a two-argument command (\\renewcommand{\\arraystretch}{1.7}) loses BOTH --
+    a regex that strips only the first leaves the second behind as text."""
+    out, i = [], 0
+    for m in re.finditer(r"\\%s\s*\*?\s*(?=\{)" % name, s):
+        if m.start() < i:
+            continue
+        args, after = grab_args(s, m.end(), nargs)
+        if args is None:
+            continue
+        out.append(s[i:m.start()])
+        i = after
+    out.append(s[i:])
+    return "".join(out)
+
+
+def env_body(s, node):
+    """The source between \\begin{X}<args> and \\end{X}, verbatim."""
+    if not node.nodelist:
+        return ""
+    first, last = node.nodelist[0], node.nodelist[-1]
+    return s[first.pos:last.pos + last.len]
+
+
+def env_spans(s, names):
+    """[(node, ancestor_env_names)] for every environment in `names`, in
+    DOCUMENT ORDER, outermost first. A match is not descended into, so the
+    spans never overlap; everything else is, so an equation nested inside a
+    subequations block is still found -- and knows it is inside one."""
+    found = []
+    try:
+        nodes, _, _ = _walker(s).get_latex_nodes()
+    except Exception:
+        return found
+    def visit(ns, anc):
+        for n in ns:
+            if isinstance(n, LatexEnvironmentNode):
+                if n.environmentname in names:
+                    found.append((n, anc))
+                    continue
+                anc2 = anc + (n.environmentname,)
+            else:
+                anc2 = anc
+            for sub in _child_nodelists(n):
+                visit(sub, anc2)
+    visit(nodes, ())
+    return found
+
+
+def replace_envs(s, names, fn):
+    """Rewrite every environment in `names` via fn(node, body, ancestors)."""
+    out, i = [], 0
+    for node, anc in env_spans(s, names):
+        if node.pos < i:                      # defensive: never go backwards
+            continue
+        out.append(s[i:node.pos])
+        out.append(fn(node, env_body(s, node), anc))
+        i = node.pos + node.len
+    out.append(s[i:])
+    return "".join(out)
+
+
+# --------------------------------------------------------------------------
+# accents
+# --------------------------------------------------------------------------
+
+# pylatexenc is used SURGICALLY here: each accent construct is located by
+# regex and only that fragment is handed to LatexNodes2Text. Running
+# latex2text over the whole document is not an option -- it deletes macros it
+# does not know and strips math outright:
+#
+#   latex_to_text(r"\newcommand{\D}{\mathcal{D}}...The graph $\D$ and $\sel(\D)$.")
+#     ->  'The graph  and ().'
+#
+# i.e. it destroys the two things this converter exists to preserve.
+
+_L2T = LatexNodes2Text(math_mode="verbatim", strict_latex_spaces="based-on-source")
+
+# \"{o}, \'e, \v{r}, \c c, \'\i ... -- control-symbol and control-word accents,
+# braced or braceless. The (?![A-Za-z]) after a control-word accent keeps \v
+# from matching inside \vec and \b from matching inside \bar.
+_ACCENT_RE = re.compile(r"""
+    \\ (?: (?P<sym>["'`^~=.])
+         | (?P<word>[uvHtcdbrk])(?![A-Za-z]) )
+    [ \t]*
+    (?: \{ (?P<braced>[^{}]*) \}
+      | \\(?P<dotless>[ij])(?![A-Za-z])
+      | (?P<bare>[A-Za-z]) )
+""", re.X)
+
+# Standalone glyphs. Longest name first, and (?![A-Za-z]) so \o does not fire
+# inside \omega, \l inside \ldots or \i inside \int.
+_GLYPH_RE = re.compile(
+    r"\\(AA|aa|AE|ae|OE|oe|DH|TH|SS|ss|O|o|L|l|i|j)(?![A-Za-z])(\{\})?([ \t]*)")
+
+
+def _fragment_to_text(frag):
+    """Unicode for one accent/glyph fragment, or None if pylatexenc has
+    nothing to offer. None means LEAVE THE SOURCE ALONE: an accent silently
+    replaced by an empty string is exactly the corruption this is fixing,
+    and the untouched command is then caught by run_checks()."""
+    try:
+        out = _L2T.latex_to_text(frag)
+    except Exception:
+        return None
+    return out if out and out != frag else None
+
+
+# The target of a \url/\href is not prose: a "\~" in there is an author
+# writing a literal tilde, and turning it into a combining accent silently
+# breaks the link. Left alone, it stays visible to run_checks() instead.
+_URL_ARG_RE = re.compile(r"\\(?:url|href)(?:@noop)?\s*\{[^{}]*\}")
+
+
+def decode_accents(s):
+    r"""Turn LaTeX accent constructs into the Unicode characters they denote.
+
+    MUST run before the "~" -> non-breaking-space replacement in do_text():
+    that replacement is a plain str.replace, so on \~{n} it eats the tilde and
+    leaves "\ {n}", which is not even valid LaTeX any more.
+    """
+    def accent(m):
+        out = _fragment_to_text(m.group(0))
+        if out is None:
+            flag("accent-unrendered",
+                 f"accent construct {m.group(0)!r} produced no character and was "
+                 f"left as raw LaTeX (\\~{{}} in a URL is the usual case) — "
+                 f"fix it by hand", m.group(0))
+            return m.group(0)
+        return out
+
+    def glyph(m):
+        out = _fragment_to_text("\\" + m.group(1))
+        if out is None:
+            flag("accent-unrendered",
+                 f"glyph command \\{m.group(1)} did not render and was left as raw "
+                 f"LaTeX — fix it by hand", m.group(0))
+            return m.group(0)
+        # TeX discards the whitespace that terminates a control word (\AA ke ->
+        # "Åke"), but an explicit \ss{} terminates it itself, so the space after
+        # THAT is a real one.
+        return out + (m.group(3) if m.group(2) else "")
+
+    def decode(t):
+        return _GLYPH_RE.sub(glyph, _ACCENT_RE.sub(accent, t))
+
+    out, i = [], 0
+    for m in _URL_ARG_RE.finditer(s):
+        out.append(decode(s[i:m.start()]))
+        out.append(m.group(0))
+        i = m.end()
+    out.append(decode(s[i:]))
+    return "".join(out)
+
 
 # --------------------------------------------------------------------------
 # preamble harvesting
@@ -356,6 +575,15 @@ def _render_bib_walk(s):
             # command names may contain '@' (\makeatletter is in effect in
             # .bbl preambles), e.g. \href@noop -- must be matched as one
             # token, not split into \href + literal "@noop".
+            # accents and standalone glyphs, before the generic dispatch: the
+            # unknown-command fallback below would drop \"{o} down to "o".
+            am = _ACCENT_RE.match(s, i) or _GLYPH_RE.match(s, i)
+            if am:
+                dec = decode_accents(am.group(0))
+                if dec != am.group(0):
+                    out.append(dec)
+                    i = am.end()
+                    continue
             m = re.match(r"\\([A-Za-z@]+\*?|.)", s[i:], re.S)
             if not m:
                 i += 1
@@ -460,7 +688,14 @@ def render_bib_body(s):
     content and dropping the semantic-markup scaffolding, rather than the
     naive 'delete backslash-commands, keep their brace arguments' approach
     (which leaves literal field names like 'author'/'title'/'journal' and
-    stray '{}' behind as visible text)."""
+    stray '{}' behind as visible text).
+
+    Accents are resolved by _render_bib_walk itself: its unknown-command
+    fallback ("drop the name, keep the brace argument") turns \\"{o} into a
+    bare "o", silently losing the umlaut — and a bibliography is where
+    accented names actually live. Decoding inside the walk rather than over
+    the whole string keeps \\href/\\url TARGETS out of it, where a literal
+    \\~ is an author writing a tilde rather than an accent."""
     text = _render_bib_walk(s)
     text = text.replace("``", '"').replace("''", '"')
     text = re.sub(r"\s+", " ", text).strip()
@@ -673,9 +908,8 @@ class Converter:
 
     # ---- figures ----
     def do_figures(self, s):
-        def one(m):
-            body = m.group(0)
-            env = m.group(1)
+        def one(node, _inner, _anc):
+            body = s[node.pos:node.pos + node.len]
             caps = []
             for cm in re.finditer(r"\\caption\s*\{", body):
                 c, _ = balanced(body, cm.end() - 1)
@@ -696,8 +930,10 @@ class Converter:
                 block = f"{fig_id} — [IMAGE: needs description]"
                 parts = [f"```\n{block}\n```"]
             else:
-                pics = re.findall(r"\\begin\{tikzpicture\}(.*?)\\end\{tikzpicture\}",
-                                  body, re.S)
+                # RAW SOURCE, span by span: the node/edge extractor parses the
+                # TikZ itself and a nested scope/tikzpicture must not truncate it.
+                pics = [body[n.pos:n.pos + n.len]
+                        for n, _ in env_spans(body, {"tikzpicture"})]
                 parts = []
                 for i, p in enumerate(pics):
                     sub = fig_id + (f"({chr(97+i)})" if len(pics) > 1 else "")
@@ -708,26 +944,77 @@ class Converter:
                     flag("figure-unknown", f"{fig_id}: no tikzpicture and no image", body)
             cap_md = f"\n**Figure {num}:** {cap}\n" if cap else ""
             return "\n\n" + "\n\n".join(parts) + "\n" + cap_md + "\n"
-        return re.sub(r"\\begin\{(figure\*?|subfigure)\}.*?\\end\{\1\}", one, s, flags=re.S)
+        return replace_envs(s, {"figure", "figure*", "subfigure"}, one)
+
+    # ---- table floats ----
+    def do_table_floats(self, s):
+        r"""\begin{table} ... \end{table} -> the float's contents plus a
+        "**Table N:** caption" line.
+
+        Unlike a figure this is NOT a replacement: the tabular inside is left
+        exactly where it is for _tables() to convert during do_text(), and only
+        the float scaffolding (placement option, \caption, \label) is taken
+        out. Before this, the whole float leaked into the Markdown as raw
+        LaTeX and the caption never became one, so every "Table 1" in the prose
+        pointed at nothing.
+        """
+        def one(node, body, _anc):
+            caps = []
+            for cm in re.finditer(r"\\caption\s*\*?\s*\{", body):
+                c, _ = balanced(body, cm.end() - 1)
+                if c:
+                    caps.append(c.strip())
+            cap = caps[-1] if caps else ""
+            if len(caps) > 1:
+                flag("table-multi-caption",
+                     f"table float carries {len(caps)} captions (sub-tables?); only "
+                     f"the last is emitted. Split them by hand.", body)
+            lm = re.search(r"\\label\s*\{([^}]*)\}", body)
+            num = self.labels.get(lm.group(1)) if lm else None
+            if num is None:
+                # LaTeX numbers the table whether or not it is labelled, so
+                # continue our own counter and say the number is derived
+                # rather than leaving the caption unnumbered (design rule 4).
+                self.counters["table"] = self.counters.get("table", 0) + 1
+                num = str(self.counters["table"])
+                why = (f"no .aux entry for table label '{lm.group(1)}'" if lm
+                       else "table float has no \\label")
+                flag("table-derived-number",
+                     f"{why} — numbered {num} by continuing the local counter. "
+                     f"Check it against the PDF.", body)
+            else:
+                try:
+                    self.counters["table"] = int(str(num).split(".")[-1])
+                except ValueError:
+                    pass
+            inner = drop_cmd_arg(drop_cmd_arg(body, "caption"), "label")
+            inner = re.sub(r"^\s*\[[^\]]*\]", "", inner)      # [h!] placement
+            if re.search(r"\\includegraphics", inner):
+                flag("table-image",
+                     f"TABLE {num}: the float holds an \\includegraphics rather than a "
+                     f"tabular — needs a human/LLM transcription of the image", body)
+            elif not env_spans(inner, {"tabular", "tabular*"}):
+                flag("table-unknown",
+                     f"TABLE {num}: table float with no tabular and no image", body)
+            cap_md = f"**Table {num}:** {cap}\n" if cap else ""
+            return "\n\n" + cap_md + "\n" + inner.strip() + "\n\n"
+        return replace_envs(s, {"table", "table*"}, one)
 
     # ---- math ----
     def do_math(self, s):
-        # Display environments, matched in ONE pass so they are visited in
-        # document order. Looping per environment type would batch all the
-        # \begin{equation}s before any \begin{align}, which makes a sequential
-        # equation counter meaningless.
+        # Display environments, visited in ONE walk so they come in document
+        # order: batching all the \begin{equation}s before any \begin{align}
+        # would make a sequential equation counter meaningless. Whether an
+        # environment sits inside \begin{subequations} -- which is what
+        # decides 5a -> 5b rather than 8b -> 9 -- is now an ancestor test on
+        # the node tree rather than an offset comparison against separately
+        # matched spans.
         if True:
-            pat = re.compile(r"\\begin\{(%s)(\*?)\}(.*?)\\end\{\1\2\}"
-                             % "|".join(MATH_ENVS), re.S)
-            # Match positions are stable for the duration of one re.sub over
-            # `s`, so an environment can be tested for containment in a
-            # subequations block -- which is what decides 5a -> 5b vs 8b -> 9.
-            sub_spans = [(mm.start(), mm.end()) for mm in re.finditer(
-                r"\\begin\{subequations\}.*?\\end\{subequations\}", s, re.S)]
-            def in_sub(pos):
-                return any(a <= pos < b for a, b in sub_spans)
-            def rep(m):
-                env, starred, inner = m.group(1), m.group(2), m.group(3)
+            names = set(MATH_ENVS) | {e + "*" for e in MATH_ENVS}
+            def rep(node, inner, anc):
+                env = node.environmentname
+                starred = env.endswith("*")
+                env = env[:-1] if starred else env
                 labs = re.findall(r"\\label\s*\{([^}]*)\}", inner)
                 tag = ""
                 if starred:
@@ -755,7 +1042,7 @@ class Converter:
                              f"numbers are referenced.", inner)
                 else:
                     prev = self.eq_last
-                    derived = next_eq_number(prev, in_sub(m.start()))
+                    derived = next_eq_number(prev, "subequations" in anc)
                     if derived:
                         tag = "\n\\tag{%s}" % derived
                         self.eq_last = derived
@@ -772,25 +1059,70 @@ class Converter:
                 if env in ("multline", "gather", "eqnarray", "align"):
                     inner = "\\begin{aligned}%s\\end{aligned}" % inner
                 return self.stash("$$\n%s%s\n$$" % (inner.strip(), tag))
-            s = pat.sub(rep, s)
+            s = replace_envs(s, names, rep)
         s = re.sub(r"\\(?:begin|end)\{subequations\}", "", s)
-        # \[ ... \]
-        s = re.sub(r"\\\[(.*?)\\\]", lambda m: self.stash("$$\n%s\n$$" % m.group(1).strip()),
-                   s, flags=re.S)
-        # inline
-        s = re.sub(r"\\\((.*?)\\\)", lambda m: self.stash("$%s$" % m.group(1).strip()),
-                   s, flags=re.S)
-        s = re.sub(r"(?<!\\)\$([^$]+)\$", lambda m: self.stash("$%s$" % m.group(1)), s)
-        return s
+        return self._stash_math(s)
+
+    def _stash_math(self, s):
+        r"""$...$, $$...$$, \[...\] and \(...\) -> placeholders, in ONE walk.
+
+        $$...$$ is TeX's own display form and used not to be handled at all.
+        The inline-$ regex that ran instead could not pair it: on "$$ x $$" it
+        found no match at the first delimiter, matched "$ x $" from the second,
+        and left a lone $ behind — so from the first $$ in a paper onwards
+        every inline pair was offset by one, and whole paragraphs of prose were
+        stashed as "math" and came back into the Markdown as raw LaTeX.
+        LatexWalker knows all four delimiter pairs, and knows \$ is not one.
+        """
+        try:
+            top, _, _ = _walker(s).get_latex_nodes()
+        except Exception:
+            return s
+        found = []
+        def visit(ns):
+            for n in ns:
+                if isinstance(n, LatexMathNode):
+                    found.append(n)
+                    continue
+                for sub in _child_nodelists(n):
+                    visit(sub)
+        visit(top)
+        out, i = [], 0
+        for n in found:
+            if n.pos < i:
+                continue
+            open_d, close_d = n.delimiters
+            inner = s[n.pos + len(open_d):n.pos + n.len - len(close_d)]
+            out.append(s[i:n.pos])
+            if n.displaytype == "display":
+                out.append(self.stash("$$\n%s\n$$" % inner.strip()))
+            else:
+                # $...$ is passed through verbatim, as it always was; only the
+                # \(...\) spelling was ever stripped.
+                out.append(self.stash("$%s$" % (inner.strip() if open_d != "$" else inner)))
+            i = n.pos + n.len
+        out.append(s[i:])
+        return "".join(out)
 
     # ---- text markup ----
     def do_text(self, s):
-        # theorem-like environments
+        # Accents first: they must be resolved before the "~" -> space
+        # replacement at the end of this method, which is a plain str.replace
+        # and would otherwise eat the tilde out of \~{n} and leave "\ {n}".
+        # Math is already stashed as placeholders by now (design rule 2), so
+        # this only ever sees text.
+        s = decode_accents(s)
+
+        # theorem-like environments. Still one environment name at a time, so
+        # a lemma inside a proof is converted before the proof wraps it.
         for env, disp in list(self.pre.theorems.items()) + [("proof", "Proof")]:
-            pat = re.compile(r"\\begin\{%s\}(\[[^\]]*\])?(.*?)\\end\{%s\}" % (env, env), re.S)
-            def rep(m, env=env, disp=disp):
-                note = (m.group(1) or "").strip("[]")
-                inner = m.group(2)
+            def rep(node, inner, anc, env=env, disp=disp):
+                # \begin{theorem}[Note] — pylatexenc leaves the optional
+                # argument of an unknown environment at the head of the body.
+                note = ""
+                nm = re.match(r"\s*\[([^\]]*)\]", inner)
+                if nm:
+                    note, inner = nm.group(1).strip(), inner[nm.end():]
                 lm = re.search(r"\\label\s*\{([^}]*)\}", inner)
                 num = self.labels.get(lm.group(1), "") if lm else ""
                 if env != "proof":
@@ -809,11 +1141,17 @@ class Converter:
                 quoted = "\n".join("> " + ln if ln.strip() else ">"
                                    for ln in (head + " " + inner).split("\n"))
                 return "\n\n" + quoted + "\n\n"
-            s = pat.sub(rep, s)
+            s = replace_envs(s, {env}, rep)
 
         # restatable: \begin{restatable}{lemma}{MacroName} body \end{restatable}
-        def restate(m):
-            env, macro, inner = m.group(1), m.group(2), m.group(3)
+        def restate(node, inner, _anc):
+            rm = re.match(r"\s*\{(\w+)\}\s*\{(\w+)\}", inner)
+            if rm is None:
+                flag("restate-unparsed",
+                     "\\begin{restatable} without the {env}{MacroName} arguments; "
+                     "left as raw LaTeX", inner[:200])
+                return s[node.pos:node.pos + node.len]
+            env, macro, inner = rm.group(1), rm.group(2), inner[rm.end():]
             disp = self.pre.theorems.get(env, env.capitalize())
             lm = re.search(r"\\label\s*\{([^}]*)\}", inner)
             num = self.labels.get(lm.group(1), "") if lm else ""
@@ -823,8 +1161,7 @@ class Converter:
             RESTATE[macro] = body
             quoted = "\n".join("> " + ln if ln.strip() else ">" for ln in body.split("\n"))
             return "\n\n" + quoted + "\n\n"
-        s = re.sub(r"\\begin\{restatable\}\{(\w+)\}\{(\w+)\}(.*?)\\end\{restatable\}",
-                   restate, s, flags=re.S)
+        s = replace_envs(s, {"restatable", "restatable*"}, restate)
         # \MacroName*  -> the stored statement
         def unrestate(m):
             body = RESTATE.get(m.group(1))
@@ -906,15 +1243,32 @@ class Converter:
         # tables
         s = self._tables(s)
 
-        # leftover structural noise
+        # leftover structural noise. The two-argument ones go first and
+        # brace-matched: the regex below strips a single {...} group, which on
+        # \\renewcommand{\\arraystretch}{1.7} left "{1.7}" behind as prose.
+        for cmd in ("renewcommand", "setlength", "addtolength",
+                    "setcounter", "counterwithin"):
+            s = drop_cmd_arg(s, cmd, 2)
+        for cmd in ("label", "nocite", "bibliographystyle", "bibliography",
+                    "vspace", "hspace"):
+            s = drop_cmd_arg(s, cmd, 1)
+        # Whatever is left takes no argument. The single regex this replaced
+        # offered an optional {[^}]*} to ALL of them, so \centering followed by
+        # a brace group swallowed the group -- with a whole table inside it.
         s = re.sub(r"\\(?:label|nocite|bibliographystyle|bibliography|maketitle|centering"
                    r"|setlength|setcounter|addtolength|counterwithin|renewcommand"
                    r"|vspace|hspace|bigskip|medskip|smallskip|noindent|onecolumn|twocolumn"
-                   r"|appendix|FloatBarrier|center|par)\b\s*(\{[^}]*\}|\[[^\]]*\])?", "", s)
+                   r"|appendix|FloatBarrier|center|par)\b\s*\*?\s*(\[[^\]]*\])?", "", s)
         s = re.sub(r"\\begin\{(document|strip|abstract|center|subfigure)\}", "", s)
         s = re.sub(r"\\end\{(document|strip|abstract|center|subfigure)\}", "", s)
         if self.args.drop_color:
             s = re.sub(r"\\color\s*\{[^}]*\}", "", s)
+        # A brace left alone on its own line is LaTeX grouping whose command has
+        # just been stripped: "{\\renewcommand{\\arraystretch}{1.7} ... }" around
+        # a table leaves "{" and "}" as prose. Deliberately only when it is the
+        # whole line, so a surviving \\begin{env} keeps its braces and stays
+        # visible to run_checks() instead of being mangled into \\beginenv.
+        s = re.sub(r"^[ \t]*[{}][ \t]*$", "", s, flags=re.M)
         s = re.sub(r"\\ ", " ", s)          # control-space after a macro
         s = re.sub(r"\\([&%#_{}])", r"\1", s)  # escaped special characters
         s = s.replace("---", "—").replace("~", " ")
@@ -955,12 +1309,31 @@ class Converter:
         return "".join(out)
 
     def _tables(self, s):
-        def one(m):
-            body = m.group(2)
+        def one(node, body, _anc):
             if re.search(r"\\multirow|\\multicolumn", body):
                 flag("table-complex",
                      "tabular uses multirow/multicolumn — convert by hand", body)
                 return self.stash("```\n[COMPLEX TABLE — see flags]\n```")
+            # A tabular inside a cell used to truncate the outer table at the
+            # inner \end{tabular}, silently dropping every row after it. The
+            # walker gets the boundary right; the inner table still cannot be
+            # rendered inside a Markdown cell, so it is emitted as a marker and
+            # flagged (design rule 4) rather than dropped or guessed at.
+            inner = env_spans(body, {"tabular"})
+            if inner:
+                out, i = [], 0
+                for n, _ in inner:
+                    out.append(body[i:n.pos])
+                    out.append("[nested table — see flags]")
+                    i = n.pos + n.len
+                out.append(body[i:])
+                flag("table-nested",
+                     f"{len(inner)} nested tabular(s) inside a table cell; the outer "
+                     f"table is emitted in full with a marker in that cell, but the "
+                     f"inner table(s) need writing by hand: "
+                     + " || ".join(body[n.pos:n.pos + n.len] for n, _ in inner),
+                     body)
+                body = "".join(out)
             rows = [r.strip() for r in re.split(r"\\\\", body) if r.strip()]
             grid = []
             for r in rows:
@@ -975,8 +1348,7 @@ class Converter:
             for r in grid[1:]:
                 out.append("| " + " | ".join(r) + " |")
             return self.stash("\n" + "\n".join(out) + "\n")
-        return re.sub(r"\\begin\{tabular\}\{([^}]*)\}(.*?)\\end\{tabular\}",
-                      one, s, flags=re.S)
+        return replace_envs(s, {"tabular", "tabular*"}, one)
 
 RESTATE = {}
 
@@ -1013,7 +1385,14 @@ def run_checks(md):
         stripped = re.sub(r"\$\$[^$]*\$\$", "", ln)   # display math on one line
         stripped = re.sub(r"\$[^$]*\$", "", stripped)
         stripped = re.sub(r"\[\^\d+\]:?", "", stripped)
-        if "_" in stripped or re.search(r"\\[A-Za-z]+", stripped):
+        # A bare command is not always a control WORD: LaTeX's commonest accents
+        # are control SYMBOLS (\"o, \'e, \~n, \=a, \.z), so a \\[A-Za-z]+ scan
+        # walks straight past exactly the constructs that corrupt text silently.
+        # Look for a backslash before a non-letter too, minus the six escapes
+        # that are legitimately how Markdown carries those characters.
+        if ("_" in stripped
+                or re.search(r"\\[A-Za-z]+", stripped)
+                or re.search(r"\\[^A-Za-z&%#_{}]", stripped)):
             viol.append((i, ln.strip()[:100]))
     if viol:
         for i, t in viol[:20]:
@@ -1100,6 +1479,7 @@ def main():
 
     conv = Converter(pre, labels, cite_order, a)
     body = conv.do_figures(body)
+    body = conv.do_table_floats(body)
     body = conv.do_math(body)                      # math -> placeholders
     for k, v in list(conv.store.items()):          # expand inside math
         if isinstance(v, str):
@@ -1119,15 +1499,16 @@ def main():
 
     # front matter
     head = []
+    # The title block never passes through do_text(), so decode its accents here.
     if pre.title:
-        head.append("# " + pre.title)
+        head.append("# " + decode_accents(pre.title))
     else:
         flag("no-title", "No \\title found in the preamble.")
     if pre.authors:
-        head.append(", ".join(f"**{n}**" + (f"<sup>{k}</sup>" if k else "")
+        head.append(", ".join(f"**{decode_accents(n)}**" + (f"<sup>{k}</sup>" if k else "")
                               for k, n in pre.authors))
     for k, v in pre.affils:
-        head.append(f"<sup>{k}</sup> {v}")
+        head.append(f"<sup>{k}</sup> {decode_accents(v)}")
     md = "\n\n".join(head) + "\n\n" + body.strip() + "\n"
 
     if conv.footnotes and not getattr(conv, "footnotes_spliced", False):

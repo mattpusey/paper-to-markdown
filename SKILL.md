@@ -27,7 +27,9 @@ command -v paper2md.py || ls ./paper2md.py ../paper2md.py 2>/dev/null \
   || git clone https://github.com/mattpusey/paper-to-markdown.git
 ```
 
-Entry point is `paper2md.py`, stdlib only. If the repo is unreachable and no local copy exists, the design is specified below well enough to rebuild — but prefer the real thing, which has been tested end to end.
+Entry point is `paper2md.py`. It needs **pylatexenc** (`pip install pylatexenc`, 2.11 is fine) — the project's only runtime dependency, used for LaTeX structure scanning (nesting-aware `\begin`/`\end` matching, brace matching, comment stripping) and for turning accent constructs into Unicode. Nothing else is needed to convert; verification additionally wants `npm install katex` (step 5) and Node on `PATH`.
+
+If the repo is unreachable and no local copy exists, the design is specified below well enough to rebuild — but prefer the real thing, which has been tested end to end (`python3 scripts/test_paper2md.py`).
 
 ## 2. Find the source, and compile it
 
@@ -82,9 +84,13 @@ The script inserts a separating space itself wherever expanding a macro would ot
 | `macro-mode-switching` | supply `--macro-override-text` and `--macro-override-math` |
 | `macro-optional-arg`, `macro-complex-signature` | `\newcommand[n][default]` or a `\NewDocumentCommand` with `o`/`s` — expand by hand |
 | `table-complex` | multirow/multicolumn — write the Markdown table yourself |
+| `table-derived-number` | a `table` float whose number came from a local counter rather than the `.aux` (no `\label`, or a label the `.aux` doesn't carry) — check it against the PDF |
+| `table-image`, `table-unknown`, `table-multi-caption` | a `table` float holding an `\includegraphics`, holding neither a `tabular` nor an image, or carrying several captions (sub-tables) — handle by hand |
 | `citet-manual` | `\citet` renders author names via the `.bst`; check the rendering against the PDF |
 | `ref-unresolved`, `cite-unresolved`, `no-aux`, `no-bbl` | go back and compile (step 2) |
 | `no-title` | `\title` wasn't found in the preamble — likely a REVTeX-style paper with frontmatter after `\begin{document}` (see step 2); rebuild the title/author/affiliation block by hand |
+| `table-nested` | a `tabular` inside another `tabular`'s cell. The outer table is emitted in full with a `[nested table — see flags]` marker in that cell; write the inner table out by hand (or inline it, if it is short) |
+| `accent-unrendered` | an accent construct that produced no character — `\~{}` used as a literal tilde inside a URL is the usual case. Rewrite it by hand |
 | `escaping-regime` | a real defect — a bare `\command` or `_` escaped into text. Fix the cause, not the symptom. A `\command{color}{...}` wrapper (e.g. `\textcolor{blue}{...}`) surviving as literal text is the same class of defect as `--drop-color` handles for `\color{...}` — strip the wrapper, keep the content, note it to the user |
 
 ## 5. Verify
@@ -96,12 +102,14 @@ npm install katex --silent          # verify.py skips the math check without it
 python3 verify.py paper.md --outline
 ```
 
+(`paper2md.py` itself only needs `pylatexenc`; KaTeX is a verification-time dependency.)
+
 It runs four checks and exits non-zero if any fails:
 
-- **Every expression parses**, via `katex_check.js`. Watch for accents LaTeX tolerates and KaTeX rejects — `\tilde\mathcal{H}` needs to be `\tilde{\mathcal{H}}` — and for `$a$$b$` from adjacent inline groups, which reads as a display-math opener. A leftover `\doibase` inside a `[text](\doibase 10.xxxx/...)` link (from REVTeX's `.bst`, expands to `http://dx.doi.org/`) is a common one on APS papers — rewrite the link target by hand if the override table didn't already catch it.
+- **Every expression parses**, via `katex_check.js`. All four LaTeX delimiter pairs are recognised on the way in (`$…$`, `$$…$$`, `\[…\]`, `\(…\)`), so a paper that uses TeX's own `$$…$$` converts like any other. Watch for accents LaTeX tolerates and KaTeX rejects — `\tilde\mathcal{H}` needs to be `\tilde{\mathcal{H}}` — and for `$a$$b$` from adjacent inline groups, which reads as a display-math opener. A leftover `\doibase` inside a `[text](\doibase 10.xxxx/...)` link (from REVTeX's `.bst`, expands to `http://dx.doi.org/`) is a common one on APS papers — rewrite the link target by hand if the override table didn't already catch it.
 - **Escaping regime**, reusing `paper2md.run_checks` so there is one implementation of the rule.
 - **Equation numbering** — `\tag{}` gaps, duplicates and ordering. Sectioned tags (`2.2`, `A.1`) are reported rather than treated as gaps.
-- **Cross-references** — every `[n]` resolves to a reference entry, every `Fig. n`/`Table n` in the prose has a caption. Float numbers are compared as strings, so `\counterwithin` numbering (`Figure 1.1`) and appendix numbering (`A.1`) work; a subfigure reference (`Fig. 4a`) resolves to its parent caption.
+- **Cross-references** — every `[n]` resolves to a reference entry, every `Fig. n`/`Table n` in the prose has a caption. `figure` and `table` floats both produce one (`**Figure n:**` / `**Table n:**`). Float numbers are compared as strings, so `\counterwithin` numbering (`Figure 1.1`) and appendix numbering (`A.1`) work; a subfigure reference (`Fig. 4a`) resolves to its parent caption.
 
 `--outline` prints the heading tree; check the numbering against the PDF and that the appendices survived. `--require-math` turns a skipped KaTeX check into a failure, for CI.
 

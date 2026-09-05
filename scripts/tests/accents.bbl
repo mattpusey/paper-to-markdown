@@ -1,0 +1,9 @@
+\begin{thebibliography}{9}
+\bibitem{schrod}
+E. Schr\"odinger, \emph{Proc. Camb. Phil. Soc.} \textbf{32}, 446 (1936).
+\bibitem{boyd}
+S. Boyd and L. Vandenberghe, \emph{Convex Optimization},
+\url{http://www.stanford.edu/\~boyd/cvxbook/} (2004).
+\bibitem{faugere}
+J.-C. Faug\`ere, Gr\"obner bases, Birkh\"auser (2001).
+\end{thebibliography}

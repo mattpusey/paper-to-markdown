@@ -1,0 +1,27 @@
+% Regression fixture: TeX's own $$...$$ display math. It was not handled at
+% all, and the inline-$ regex that ran instead could not pair it -- so from
+% the first $$ onwards every inline pair was offset by one and paragraphs of
+% prose were stashed as "math" and came back as raw LaTeX.
+% dollars.aux is committed alongside; regenerate with
+%   pdflatex -interaction=nonstopmode dollars
+\documentclass{article}
+\begin{document}
+
+Before the display, an inline $a+b$ and a reference to \emph{something}.
+
+$$
+c = d
+$$
+
+After the display: \emph{this must still be emphasis}, $e+f$ must still be
+math, and \ref{sec:later} must still resolve.
+
+\[ g = h \]
+
+An inline-math \( i + j \) too.
+
+\section{Later}\label{sec:later}
+
+Still converted this far down: \emph{yes}.
+
+\end{document}

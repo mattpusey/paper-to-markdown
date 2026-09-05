@@ -1,0 +1,53 @@
+% Regression fixture: environments that nest. Every \begin{X}(.*?)\end{X}
+% regex truncated these at the first inner \end{X}. nesting.aux is committed
+% alongside so the test does not need a LaTeX toolchain; regenerate it with
+%   pdflatex -interaction=nonstopmode nesting
+\documentclass{article}
+\usepackage{amsmath,tikz}
+\begin{document}
+
+\section{Nested tabular}
+
+A tabular inside a cell used to truncate the outer table at the inner
+end-of-environment, silently dropping the rows after it.
+
+\begin{tabular}{cc}
+A & B \\
+C & \begin{tabular}{c} inner1 \\ inner2 \end{tabular} \\
+D & E \\
+\end{tabular}
+
+\section{Subequations}
+
+\begin{equation}\label{eq:first}
+  x = 1
+\end{equation}
+
+\begin{subequations}\label{eq:sub}
+\begin{equation}\label{eq:suba}
+  y = 2
+\end{equation}
+\begin{equation}
+  y' = 3
+\end{equation}
+\end{subequations}
+
+\begin{equation}
+  z = 4
+\end{equation}
+
+\section{Nested tikz scopes}
+
+\begin{figure}[h]
+\begin{tikzpicture}
+  \node (a) at (0,0) {$A$};
+  \begin{scope}[xshift=3cm]
+    \node (b) at (0,0) {$B$};
+  \end{scope}
+  \node (c) at (0,-2) {$C$};
+  \draw[->] (a) -- (c);
+\end{tikzpicture}
+\caption{Figure with a scope.}\label{fig:tikz}
+\end{figure}
+
+\end{document}
