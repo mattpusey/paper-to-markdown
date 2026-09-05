@@ -21,6 +21,17 @@ Design rules
 4. Anything ambiguous is FLAGGED, never silently dropped. Where a value can
    be derived instead of left missing it is emitted AND flagged, on the
    grounds that a visible guess beats an invisible hole.
+5. Structure is PARSED, not pattern-matched: pylatexenc's LatexWalker does
+   the \begin/\end matching, brace matching and comment stripping, so
+   nesting is seen (a tabular inside a tabular no longer truncates the outer
+   one at the first inner \end{tabular}). pylatexenc also converts accent
+   constructs to Unicode -- but only fragment by fragment. latex2text is
+   never run over the document: it deletes macros it does not know and
+   strips math outright, which would destroy both things rule 1 and rule 2
+   exist to protect. Macro harvesting and expansion stay ours; LatexWalker
+   does not expand \newcommand.
+
+Requires pylatexenc (pip install pylatexenc; 2.11 is fine).
 
 Usage
 -----
@@ -37,6 +48,8 @@ from collections import OrderedDict, Counter
 
 try:
     from pylatexenc.latex2text import LatexNodes2Text
+    from pylatexenc.latexwalker import (LatexWalker, LatexCommentNode,
+                                        LatexEnvironmentNode, LatexGroupNode)
 except ImportError:                                   # pragma: no cover
     sys.exit("paper2md.py needs pylatexenc (pip install pylatexenc)")
 
@@ -51,27 +64,43 @@ def flag(kind, detail, snippet="", line=None):
                   "snippet": snippet[:400], "line": line})
 
 # --------------------------------------------------------------------------
-# brace matching
+# scanning primitives
 # --------------------------------------------------------------------------
+#
+# All structural scanning goes through pylatexenc's LatexWalker. The regexes
+# these replaced could not see nesting: every \begin{X}(.*?)\end{X} stopped at
+# the FIRST inner \end{X}, so a tabular inside a tabular truncated the outer
+# one and dropped every row after it -- silently, which is the one thing this
+# converter is not allowed to do. LatexWalker parses properly and hands back
+# .pos/.len, so the layers above still work on strings and spans.
+#
+# What LatexWalker does NOT do is expand \newcommand; macro harvesting and
+# expansion below stay ours.
+
+def _walker(s):
+    return LatexWalker(s, tolerant_parsing=True)
+
 
 def balanced(s, i, open_ch="{", close_ch="}"):
-    """s[i] must be open_ch. Return (content, index_after_close)."""
+    """s[i] must be open_ch. Return (content, index_after_close).
+
+    Delimiter matching is LatexWalker's, so a brace inside a % comment or a
+    \\verb argument cannot throw the count off.
+    """
     if i >= len(s) or s[i] != open_ch:
         return None, i
-    depth, j = 0, i
-    while j < len(s):
-        c = s[j]
-        if c == "\\":
-            j += 2
-            continue
-        if c == open_ch:
-            depth += 1
-        elif c == close_ch:
-            depth -= 1
-            if depth == 0:
-                return s[i + 1:j], j + 1
-        j += 1
-    return None, i
+    try:
+        w = _walker(s)
+        if open_ch == "{":
+            node, pos, ln = w.get_latex_expression(pos=i)
+        else:
+            node, pos, ln = w.get_latex_maybe_optional_arg(pos=i)
+    except Exception:
+        return None, i
+    if node is None or not isinstance(node, LatexGroupNode) or ln < 2:
+        return None, i
+    return s[pos + 1:pos + ln - 1], pos + ln
+
 
 def grab_args(s, i, n):
     """Grab n balanced {..} groups starting at s[i] (skipping whitespace)."""
@@ -86,23 +115,94 @@ def grab_args(s, i, n):
         i = ni
     return args, i
 
+
 def strip_comments(s):
+    """Drop % comments, reproducing TeX's rule that a comment eats the rest of
+    the line plus the following line's leading whitespace."""
+    try:
+        nodes, _, _ = _walker(s).get_latex_nodes()
+    except Exception:
+        return s
     out, i = [], 0
-    while i < len(s):
-        c = s[i]
-        if c == "\\" and i + 1 < len(s):
-            out.append(s[i:i + 2]); i += 2; continue
-        if c == "%":
-            j = s.find("\n", i)
-            if j == -1: break
-            i = j + 1
-            # a comment consumes the newline plus leading whitespace (TeX rule)
-            while i < len(s) and s[i] in " \t":
-                i += 1
-            out.append("\n")
-            continue
-        out.append(c); i += 1
+    def visit(ns):
+        nonlocal i
+        for n in ns:
+            if isinstance(n, LatexCommentNode):
+                out.append(s[i:n.pos])
+                ps = n.comment_post_space
+                # The comment node spans "%...", its newline and the leading
+                # whitespace of the next line. TeX ends the line and eats that
+                # indentation; anything past it (a blank line, i.e. a paragraph
+                # break) is ordinary text and has to survive.
+                out.append("\n" + ps[1:].lstrip(" \t")
+                           if ps.startswith("\n") else ps)
+                i = n.pos + n.len
+                continue
+            for sub in _child_nodelists(n):
+                visit(sub)
+    visit(nodes)
+    out.append(s[i:])
     return "".join(out)
+
+
+def _child_nodelists(node):
+    """Every child node list hanging off `node` — body, group content and
+    macro/environment arguments alike."""
+    lists = []
+    nl = getattr(node, "nodelist", None)
+    if nl:
+        lists.append(nl)
+    argd = getattr(node, "nodeargd", None)
+    if argd is not None and getattr(argd, "argnlist", None):
+        lists.append([a for a in argd.argnlist if a is not None])
+    return lists
+
+
+def env_body(s, node):
+    """The source between \\begin{X}<args> and \\end{X}, verbatim."""
+    if not node.nodelist:
+        return ""
+    first, last = node.nodelist[0], node.nodelist[-1]
+    return s[first.pos:last.pos + last.len]
+
+
+def env_spans(s, names):
+    """[(node, ancestor_env_names)] for every environment in `names`, in
+    DOCUMENT ORDER, outermost first. A match is not descended into, so the
+    spans never overlap; everything else is, so an equation nested inside a
+    subequations block is still found -- and knows it is inside one."""
+    found = []
+    try:
+        nodes, _, _ = _walker(s).get_latex_nodes()
+    except Exception:
+        return found
+    def visit(ns, anc):
+        for n in ns:
+            if isinstance(n, LatexEnvironmentNode):
+                if n.environmentname in names:
+                    found.append((n, anc))
+                    continue
+                anc2 = anc + (n.environmentname,)
+            else:
+                anc2 = anc
+            for sub in _child_nodelists(n):
+                visit(sub, anc2)
+    visit(nodes, ())
+    return found
+
+
+def replace_envs(s, names, fn):
+    """Rewrite every environment in `names` via fn(node, body, ancestors)."""
+    out, i = [], 0
+    for node, anc in env_spans(s, names):
+        if node.pos < i:                      # defensive: never go backwards
+            continue
+        out.append(s[i:node.pos])
+        out.append(fn(node, env_body(s, node), anc))
+        i = node.pos + node.len
+    out.append(s[i:])
+    return "".join(out)
+
 
 # --------------------------------------------------------------------------
 # accents
@@ -787,9 +887,8 @@ class Converter:
 
     # ---- figures ----
     def do_figures(self, s):
-        def one(m):
-            body = m.group(0)
-            env = m.group(1)
+        def one(node, _inner, _anc):
+            body = s[node.pos:node.pos + node.len]
             caps = []
             for cm in re.finditer(r"\\caption\s*\{", body):
                 c, _ = balanced(body, cm.end() - 1)
@@ -810,8 +909,10 @@ class Converter:
                 block = f"{fig_id} — [IMAGE: needs description]"
                 parts = [f"```\n{block}\n```"]
             else:
-                pics = re.findall(r"\\begin\{tikzpicture\}(.*?)\\end\{tikzpicture\}",
-                                  body, re.S)
+                # RAW SOURCE, span by span: the node/edge extractor parses the
+                # TikZ itself and a nested scope/tikzpicture must not truncate it.
+                pics = [body[n.pos:n.pos + n.len]
+                        for n, _ in env_spans(body, {"tikzpicture"})]
                 parts = []
                 for i, p in enumerate(pics):
                     sub = fig_id + (f"({chr(97+i)})" if len(pics) > 1 else "")
@@ -822,26 +923,23 @@ class Converter:
                     flag("figure-unknown", f"{fig_id}: no tikzpicture and no image", body)
             cap_md = f"\n**Figure {num}:** {cap}\n" if cap else ""
             return "\n\n" + "\n\n".join(parts) + "\n" + cap_md + "\n"
-        return re.sub(r"\\begin\{(figure\*?|subfigure)\}.*?\\end\{\1\}", one, s, flags=re.S)
+        return replace_envs(s, {"figure", "figure*", "subfigure"}, one)
 
     # ---- math ----
     def do_math(self, s):
-        # Display environments, matched in ONE pass so they are visited in
-        # document order. Looping per environment type would batch all the
-        # \begin{equation}s before any \begin{align}, which makes a sequential
-        # equation counter meaningless.
+        # Display environments, visited in ONE walk so they come in document
+        # order: batching all the \begin{equation}s before any \begin{align}
+        # would make a sequential equation counter meaningless. Whether an
+        # environment sits inside \begin{subequations} -- which is what
+        # decides 5a -> 5b rather than 8b -> 9 -- is now an ancestor test on
+        # the node tree rather than an offset comparison against separately
+        # matched spans.
         if True:
-            pat = re.compile(r"\\begin\{(%s)(\*?)\}(.*?)\\end\{\1\2\}"
-                             % "|".join(MATH_ENVS), re.S)
-            # Match positions are stable for the duration of one re.sub over
-            # `s`, so an environment can be tested for containment in a
-            # subequations block -- which is what decides 5a -> 5b vs 8b -> 9.
-            sub_spans = [(mm.start(), mm.end()) for mm in re.finditer(
-                r"\\begin\{subequations\}.*?\\end\{subequations\}", s, re.S)]
-            def in_sub(pos):
-                return any(a <= pos < b for a, b in sub_spans)
-            def rep(m):
-                env, starred, inner = m.group(1), m.group(2), m.group(3)
+            names = set(MATH_ENVS) | {e + "*" for e in MATH_ENVS}
+            def rep(node, inner, anc):
+                env = node.environmentname
+                starred = env.endswith("*")
+                env = env[:-1] if starred else env
                 labs = re.findall(r"\\label\s*\{([^}]*)\}", inner)
                 tag = ""
                 if starred:
@@ -869,7 +967,7 @@ class Converter:
                              f"numbers are referenced.", inner)
                 else:
                     prev = self.eq_last
-                    derived = next_eq_number(prev, in_sub(m.start()))
+                    derived = next_eq_number(prev, "subequations" in anc)
                     if derived:
                         tag = "\n\\tag{%s}" % derived
                         self.eq_last = derived
@@ -886,7 +984,7 @@ class Converter:
                 if env in ("multline", "gather", "eqnarray", "align"):
                     inner = "\\begin{aligned}%s\\end{aligned}" % inner
                 return self.stash("$$\n%s%s\n$$" % (inner.strip(), tag))
-            s = pat.sub(rep, s)
+            s = replace_envs(s, names, rep)
         s = re.sub(r"\\(?:begin|end)\{subequations\}", "", s)
         # \[ ... \]
         s = re.sub(r"\\\[(.*?)\\\]", lambda m: self.stash("$$\n%s\n$$" % m.group(1).strip()),
@@ -906,12 +1004,16 @@ class Converter:
         # this only ever sees text.
         s = decode_accents(s)
 
-        # theorem-like environments
+        # theorem-like environments. Still one environment name at a time, so
+        # a lemma inside a proof is converted before the proof wraps it.
         for env, disp in list(self.pre.theorems.items()) + [("proof", "Proof")]:
-            pat = re.compile(r"\\begin\{%s\}(\[[^\]]*\])?(.*?)\\end\{%s\}" % (env, env), re.S)
-            def rep(m, env=env, disp=disp):
-                note = (m.group(1) or "").strip("[]")
-                inner = m.group(2)
+            def rep(node, inner, anc, env=env, disp=disp):
+                # \begin{theorem}[Note] — pylatexenc leaves the optional
+                # argument of an unknown environment at the head of the body.
+                note = ""
+                nm = re.match(r"\s*\[([^\]]*)\]", inner)
+                if nm:
+                    note, inner = nm.group(1).strip(), inner[nm.end():]
                 lm = re.search(r"\\label\s*\{([^}]*)\}", inner)
                 num = self.labels.get(lm.group(1), "") if lm else ""
                 if env != "proof":
@@ -930,11 +1032,17 @@ class Converter:
                 quoted = "\n".join("> " + ln if ln.strip() else ">"
                                    for ln in (head + " " + inner).split("\n"))
                 return "\n\n" + quoted + "\n\n"
-            s = pat.sub(rep, s)
+            s = replace_envs(s, {env}, rep)
 
         # restatable: \begin{restatable}{lemma}{MacroName} body \end{restatable}
-        def restate(m):
-            env, macro, inner = m.group(1), m.group(2), m.group(3)
+        def restate(node, inner, _anc):
+            rm = re.match(r"\s*\{(\w+)\}\s*\{(\w+)\}", inner)
+            if rm is None:
+                flag("restate-unparsed",
+                     "\\begin{restatable} without the {env}{MacroName} arguments; "
+                     "left as raw LaTeX", inner[:200])
+                return s[node.pos:node.pos + node.len]
+            env, macro, inner = rm.group(1), rm.group(2), inner[rm.end():]
             disp = self.pre.theorems.get(env, env.capitalize())
             lm = re.search(r"\\label\s*\{([^}]*)\}", inner)
             num = self.labels.get(lm.group(1), "") if lm else ""
@@ -944,8 +1052,7 @@ class Converter:
             RESTATE[macro] = body
             quoted = "\n".join("> " + ln if ln.strip() else ">" for ln in body.split("\n"))
             return "\n\n" + quoted + "\n\n"
-        s = re.sub(r"\\begin\{restatable\}\{(\w+)\}\{(\w+)\}(.*?)\\end\{restatable\}",
-                   restate, s, flags=re.S)
+        s = replace_envs(s, {"restatable", "restatable*"}, restate)
         # \MacroName*  -> the stored statement
         def unrestate(m):
             body = RESTATE.get(m.group(1))
@@ -1076,12 +1183,31 @@ class Converter:
         return "".join(out)
 
     def _tables(self, s):
-        def one(m):
-            body = m.group(2)
+        def one(node, body, _anc):
             if re.search(r"\\multirow|\\multicolumn", body):
                 flag("table-complex",
                      "tabular uses multirow/multicolumn — convert by hand", body)
                 return self.stash("```\n[COMPLEX TABLE — see flags]\n```")
+            # A tabular inside a cell used to truncate the outer table at the
+            # inner \end{tabular}, silently dropping every row after it. The
+            # walker gets the boundary right; the inner table still cannot be
+            # rendered inside a Markdown cell, so it is emitted as a marker and
+            # flagged (design rule 4) rather than dropped or guessed at.
+            inner = env_spans(body, {"tabular"})
+            if inner:
+                out, i = [], 0
+                for n, _ in inner:
+                    out.append(body[i:n.pos])
+                    out.append("[nested table — see flags]")
+                    i = n.pos + n.len
+                out.append(body[i:])
+                flag("table-nested",
+                     f"{len(inner)} nested tabular(s) inside a table cell; the outer "
+                     f"table is emitted in full with a marker in that cell, but the "
+                     f"inner table(s) need writing by hand: "
+                     + " || ".join(body[n.pos:n.pos + n.len] for n, _ in inner),
+                     body)
+                body = "".join(out)
             rows = [r.strip() for r in re.split(r"\\\\", body) if r.strip()]
             grid = []
             for r in rows:
@@ -1096,8 +1222,7 @@ class Converter:
             for r in grid[1:]:
                 out.append("| " + " | ".join(r) + " |")
             return self.stash("\n" + "\n".join(out) + "\n")
-        return re.sub(r"\\begin\{tabular\}\{([^}]*)\}(.*?)\\end\{tabular\}",
-                      one, s, flags=re.S)
+        return replace_envs(s, {"tabular", "tabular*"}, one)
 
 RESTATE = {}
 

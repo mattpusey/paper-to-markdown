@@ -27,7 +27,9 @@ command -v paper2md.py || ls ./paper2md.py ../paper2md.py 2>/dev/null \
   || git clone https://github.com/mattpusey/paper-to-markdown.git
 ```
 
-Entry point is `paper2md.py`, stdlib only. If the repo is unreachable and no local copy exists, the design is specified below well enough to rebuild — but prefer the real thing, which has been tested end to end.
+Entry point is `paper2md.py`. It needs **pylatexenc** (`pip install pylatexenc`, 2.11 is fine) — the project's only runtime dependency, used for LaTeX structure scanning (nesting-aware `\begin`/`\end` matching, brace matching, comment stripping) and for turning accent constructs into Unicode. Nothing else is needed to convert; verification additionally wants `npm install katex` (step 5) and Node on `PATH`.
+
+If the repo is unreachable and no local copy exists, the design is specified below well enough to rebuild — but prefer the real thing, which has been tested end to end (`python3 scripts/test_paper2md.py`).
 
 ## 2. Find the source, and compile it
 
@@ -85,6 +87,8 @@ The script inserts a separating space itself wherever expanding a macro would ot
 | `citet-manual` | `\citet` renders author names via the `.bst`; check the rendering against the PDF |
 | `ref-unresolved`, `cite-unresolved`, `no-aux`, `no-bbl` | go back and compile (step 2) |
 | `no-title` | `\title` wasn't found in the preamble — likely a REVTeX-style paper with frontmatter after `\begin{document}` (see step 2); rebuild the title/author/affiliation block by hand |
+| `table-nested` | a `tabular` inside another `tabular`'s cell. The outer table is emitted in full with a `[nested table — see flags]` marker in that cell; write the inner table out by hand (or inline it, if it is short) |
+| `accent-unrendered` | an accent construct that produced no character — `\~{}` used as a literal tilde inside a URL is the usual case. Rewrite it by hand |
 | `escaping-regime` | a real defect — a bare `\command` or `_` escaped into text. Fix the cause, not the symptom. A `\command{color}{...}` wrapper (e.g. `\textcolor{blue}{...}`) surviving as literal text is the same class of defect as `--drop-color` handles for `\color{...}` — strip the wrapper, keep the content, note it to the user |
 
 ## 5. Verify
@@ -95,6 +99,8 @@ The script inserts a separating space itself wherever expanding a macro would ot
 npm install katex --silent          # verify.py skips the math check without it
 python3 verify.py paper.md --outline
 ```
+
+(`paper2md.py` itself only needs `pylatexenc`; KaTeX is a verification-time dependency.)
 
 It runs four checks and exits non-zero if any fails:
 

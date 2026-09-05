@@ -8,7 +8,7 @@ this file; they are minimal, compilable LaTeX so they can also be run
 through the real pipeline by hand.
 """
 
-import json, os, subprocess, sys, tempfile, unittest
+import json, os, re, subprocess, sys, tempfile, unittest
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -107,6 +107,53 @@ class Accents(unittest.TestCase):
         # the one thing left raw is the URL tilde, and it is flagged, not silent
         self.assertEqual(sorted(f["kind"] for f in flags), ["escaping-regime", "no-aux"])
         self.assertTrue(any(r"\~boyd" in f["snippet"] for f in flags))
+
+
+class Nesting(unittest.TestCase):
+    """Every \\begin{X}(.*?)\\end{X} regex stopped at the FIRST inner
+    \\end{X}, so a tabular inside a cell truncated the outer table and the
+    rows after it disappeared without a flag."""
+
+    def test_env_spans_sees_nesting(self):
+        src = ("\\begin{tabular}{cc}\nA & B \\\\\n"
+               "C & \\begin{tabular}{c} i1 \\\\ i2 \\end{tabular} \\\\\n"
+               "D & E \\\\\n\\end{tabular}\n")
+        spans = paper2md.env_spans(src, {"tabular"})
+        self.assertEqual(len(spans), 1)                  # outermost only
+        node, anc = spans[0]
+        self.assertEqual(anc, ())
+        self.assertEqual(src[node.pos:node.pos + node.len].count("D & E"), 1)
+        self.assertTrue(src[node.pos:node.pos + node.len].endswith("\\end{tabular}"))
+        # and the inner one is reachable from the outer body
+        body = paper2md.env_body(src, node)
+        self.assertEqual(len(paper2md.env_spans(body, {"tabular"})), 1)
+
+    def test_ancestors_are_reported(self):
+        src = ("\\begin{subequations}\n\\begin{equation} a \\end{equation}\n"
+               "\\end{subequations}\n\\begin{equation} b \\end{equation}")
+        spans = paper2md.env_spans(src, {"equation"})
+        self.assertEqual([anc for _, anc in spans], [("subequations",), ()])
+
+    def test_comment_cannot_unbalance_a_group(self):
+        self.assertEqual(paper2md.balanced("{a % }\nb}", 0)[0], "a % }\nb")
+
+    def test_end_to_end(self):
+        md, flags = convert("nesting")
+        # the rows that used to vanish
+        self.assertIn("| D | E |", md)
+        self.assertIn("| A | B |", md)
+        # the inner table is not guessed at, it is marked and flagged
+        self.assertIn("[nested table — see flags]", md)
+        nested = [f for f in flags if f["kind"] == "table-nested"]
+        self.assertEqual(len(nested), 1)
+        self.assertIn("inner1", nested[0]["detail"])
+        self.assertIn("inner2", nested[0]["detail"])
+        # subequations: 2a is read from the .aux, 2b derived inside the block,
+        # 3 derived after leaving it
+        self.assertEqual(re.findall(r"\\tag\{([^}]*)\}", md), ["1", "2a", "2b", "3"])
+        # tikz survives a nested \scope
+        self.assertIn("A, B, C   [unstyled]", md)
+        self.assertIn("A -> C", md)
 
 
 if __name__ == "__main__":
