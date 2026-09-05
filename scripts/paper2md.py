@@ -1013,7 +1013,14 @@ def run_checks(md):
         stripped = re.sub(r"\$\$[^$]*\$\$", "", ln)   # display math on one line
         stripped = re.sub(r"\$[^$]*\$", "", stripped)
         stripped = re.sub(r"\[\^\d+\]:?", "", stripped)
-        if "_" in stripped or re.search(r"\\[A-Za-z]+", stripped):
+        # A bare command is not always a control WORD: LaTeX's commonest accents
+        # are control SYMBOLS (\"o, \'e, \~n, \=a, \.z), so a \\[A-Za-z]+ scan
+        # walks straight past exactly the constructs that corrupt text silently.
+        # Look for a backslash before a non-letter too, minus the six escapes
+        # that are legitimately how Markdown carries those characters.
+        if ("_" in stripped
+                or re.search(r"\\[A-Za-z]+", stripped)
+                or re.search(r"\\[^A-Za-z&%#_{}]", stripped)):
             viol.append((i, ln.strip()[:100]))
     if viol:
         for i, t in viol[:20]:
