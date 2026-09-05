@@ -156,5 +156,42 @@ class Nesting(unittest.TestCase):
         self.assertIn("A -> C", md)
 
 
+class DollarDisplayMath(unittest.TestCase):
+    r"""$$...$$ was not handled. The inline-$ regex that ran instead could not
+    pair it, so from the first $$ in a paper onwards every inline pair was
+    offset by one and prose was swallowed into math placeholders."""
+
+    def stash_math(self, src):
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""), {}, {}, _Args())
+        return conv.restore(conv._stash_math(src))
+
+    def test_all_four_delimiter_pairs(self):
+        self.assertEqual(self.stash_math(r"a $x$ b"), "a $x$ b")
+        self.assertEqual(self.stash_math(r"a \( x \) b"), "a $x$ b")
+        self.assertEqual(self.stash_math("a $$ x $$ b"), "a \n\n$$\nx\n$$\n\n b")
+        self.assertEqual(self.stash_math(r"a \[ x \] b"), "a \n\n$$\nx\n$$\n\n b")
+
+    def test_display_does_not_offset_the_inline_pairs_after_it(self):
+        # the actual defect: "y" and "z" are math, " and " is prose
+        out = self.stash_math("$$ x $$ then $y$ and $z$")
+        self.assertIn("$y$ and $z$", out)
+
+    def test_escaped_dollar_is_not_a_delimiter(self):
+        self.assertEqual(self.stash_math(r"costs \$5 and \$6, with $x$"),
+                         r"costs \$5 and \$6, with $x$")
+
+    def test_end_to_end(self):
+        md, flags = convert("dollars")
+        self.assertIn("$$\nc = d\n$$", md)
+        # prose after the display used to arrive as raw LaTeX
+        self.assertIn("*this must still be emphasis*", md)
+        self.assertNotIn("\\emph{", md)
+        self.assertIn("$e+f$", md)
+        self.assertIn("## Later", md)
+        self.assertEqual([f["kind"] for f in flags if f["kind"] == "escaping-regime"], [])
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

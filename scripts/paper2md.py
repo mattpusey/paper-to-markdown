@@ -11,6 +11,9 @@ Design rules
 2. Math is extracted to placeholders BEFORE any text-level markup conversion,
    and restored afterwards. This guarantees one escaping regime: every LaTeX
    command and every underscore ends up inside $...$, a $$ block, or a fence.
+   All four delimiter pairs -- $...$, $$...$$, \[...\] and \(...\) -- are
+   found by the same LatexWalker pass, so an unpaired-looking delimiter
+   cannot shift the pairing of everything after it.
 3. Numbering comes from the .aux file, the bibliography from the .bbl file:
    no PDF scraping and no staleness window, since both regenerate on every
    compile. LaTeX's counter machinery is NOT reimplemented -- but where
@@ -49,7 +52,8 @@ from collections import OrderedDict, Counter
 try:
     from pylatexenc.latex2text import LatexNodes2Text
     from pylatexenc.latexwalker import (LatexWalker, LatexCommentNode,
-                                        LatexEnvironmentNode, LatexGroupNode)
+                                        LatexEnvironmentNode, LatexGroupNode,
+                                        LatexMathNode)
 except ImportError:                                   # pragma: no cover
     sys.exit("paper2md.py needs pylatexenc (pip install pylatexenc)")
 
@@ -986,14 +990,48 @@ class Converter:
                 return self.stash("$$\n%s%s\n$$" % (inner.strip(), tag))
             s = replace_envs(s, names, rep)
         s = re.sub(r"\\(?:begin|end)\{subequations\}", "", s)
-        # \[ ... \]
-        s = re.sub(r"\\\[(.*?)\\\]", lambda m: self.stash("$$\n%s\n$$" % m.group(1).strip()),
-                   s, flags=re.S)
-        # inline
-        s = re.sub(r"\\\((.*?)\\\)", lambda m: self.stash("$%s$" % m.group(1).strip()),
-                   s, flags=re.S)
-        s = re.sub(r"(?<!\\)\$([^$]+)\$", lambda m: self.stash("$%s$" % m.group(1)), s)
-        return s
+        return self._stash_math(s)
+
+    def _stash_math(self, s):
+        r"""$...$, $$...$$, \[...\] and \(...\) -> placeholders, in ONE walk.
+
+        $$...$$ is TeX's own display form and used not to be handled at all.
+        The inline-$ regex that ran instead could not pair it: on "$$ x $$" it
+        found no match at the first delimiter, matched "$ x $" from the second,
+        and left a lone $ behind — so from the first $$ in a paper onwards
+        every inline pair was offset by one, and whole paragraphs of prose were
+        stashed as "math" and came back into the Markdown as raw LaTeX.
+        LatexWalker knows all four delimiter pairs, and knows \$ is not one.
+        """
+        try:
+            top, _, _ = _walker(s).get_latex_nodes()
+        except Exception:
+            return s
+        found = []
+        def visit(ns):
+            for n in ns:
+                if isinstance(n, LatexMathNode):
+                    found.append(n)
+                    continue
+                for sub in _child_nodelists(n):
+                    visit(sub)
+        visit(top)
+        out, i = [], 0
+        for n in found:
+            if n.pos < i:
+                continue
+            open_d, close_d = n.delimiters
+            inner = s[n.pos + len(open_d):n.pos + n.len - len(close_d)]
+            out.append(s[i:n.pos])
+            if n.displaytype == "display":
+                out.append(self.stash("$$\n%s\n$$" % inner.strip()))
+            else:
+                # $...$ is passed through verbatim, as it always was; only the
+                # \(...\) spelling was ever stripped.
+                out.append(self.stash("$%s$" % (inner.strip() if open_d != "$" else inner)))
+            i = n.pos + n.len
+        out.append(s[i:])
+        return "".join(out)
 
     # ---- text markup ----
     def do_text(self, s):
