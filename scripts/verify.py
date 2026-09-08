@@ -15,13 +15,15 @@ than reimplemented, so it also covers output that paper2md.py never
 produced (a PDF-only conversion, or a hand-edited file).
 
 The third verification in SKILL.md — the word-frequency diff against the
-source — is not here. It needs a different stripper per source type
-(.tex comments and tikzpicture bodies vs. a PDF text layer) and is a
-separate piece of work.
+source — lives in srcdiff.py, which needs a different stripper per source
+type (.tex, a PDF text layer, OCR of a scan). Pass --source to run it from
+here. Without it nothing below compares the Markdown to the paper, so a
+dropped paragraph passes every check on this page: the closing line says so.
 
 Usage
 -----
     python3 verify.py paper.md [--json report.json] [--require-math]
+    python3 verify.py paper.md --source paper.tex
 
 Exit codes: 0 clean, 1 problems found, 2 usage error.
 """
@@ -226,6 +228,30 @@ def outline(md):
 # main
 # --------------------------------------------------------------------------
 
+def check_source(md_path, source, mode, ocr_dpi):
+    """Delegate to srcdiff.py. Reports; never fails the run."""
+    try:
+        import srcdiff
+    except ImportError:                               # pragma: no cover
+        return {"status": "SKIPPED",
+                "reason": "srcdiff.py not alongside verify.py"}, True
+    try:
+        used, pages = srcdiff.extract_source(source, mode, quiet=True,
+                                             ocr_dpi=ocr_dpi)
+        res, _ = srcdiff.compare(md_path, pages)
+    except SystemExit as exc:                         # missing tesseract etc.
+        return {"status": "SKIPPED", "reason": str(exc)}, True
+
+    return ({"status": "OK" if not res["missing"] and not res["extra"]
+                       else "REVIEW",
+             "mode": used, "pages": len(pages),
+             "source_words": res["source_words"], "md_words": res["md_words"],
+             "missing": [w for w, _ in res["missing"]],
+             "extra": [w for w, _ in res["extra"]],
+             "filtered": sum(res["missing_noise"].values())
+                         + sum(res["extra_noise"].values())}, True)
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__,
                                  formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -235,6 +261,12 @@ def main():
                     help="treat a skipped KaTeX check as a failure (for CI)")
     ap.add_argument("--outline", action="store_true",
                     help="print the heading tree for comparison against the PDF")
+    ap.add_argument("--source", default=None,
+                    help="also diff the prose against this .tex or .pdf "
+                         "(srcdiff.py); reports, never fails")
+    ap.add_argument("--source-mode", default="auto",
+                    choices=["auto", "tex", "pdftext", "ocr"])
+    ap.add_argument("--ocr-dpi", type=int, default=300)
     a = ap.parse_args()
 
     if not os.path.exists(a.md):
@@ -250,7 +282,9 @@ def main():
         ("equation_numbering", check_equations(md)),
         ("citations", check_citations(md)),
         ("floats", check_floats(md)),
-    ]:
+    ] + ([("source_comparison",
+           check_source(a.md, a.source, a.source_mode, a.ocr_dpi))]
+         if a.source else []):
         report[name] = section
         oks.append(ok)
 
@@ -314,6 +348,21 @@ def main():
     if fl["referenced_but_absent_tables"]:
         print(f"      referenced but absent: Table {fl['referenced_but_absent_tables']}")
 
+    if "source_comparison" in report:
+        sc = report["source_comparison"]
+        if sc["status"] == "SKIPPED":
+            print(f"  source comparison   SKIPPED: {sc['reason']}")
+        else:
+            print(f"  source comparison   {sc['status']}  "
+                  f"({sc['mode']}, {sc['source_words']} source words vs "
+                  f"{sc['md_words']} in markdown, {sc['filtered']} filtered)")
+            if sc["missing"]:
+                print(f"      in source only: {', '.join(sc['missing'][:12])}")
+            if sc["extra"]:
+                print(f"      in markdown only: {', '.join(sc['extra'][:12])}")
+            if sc["missing"] or sc["extra"]:
+                print("      run srcdiff.py for page numbers and context")
+
     if a.outline:
         print("\n  outline:")
         for h in outline(md):
@@ -327,6 +376,9 @@ def main():
         print("all checks passed"
               + (" (some skipped)" if any(v.get("status") == "SKIPPED"
                                           for v in report.values()) else ""))
+        if "source_comparison" not in report:
+            print("  — but nothing here compared the markdown to the paper;"
+                  " for that pass --source")
 
     if a.json:
         json.dump(report, open(a.json, "w"), indent=2)
