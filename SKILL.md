@@ -29,11 +29,36 @@ command -v paper2md.py || ls ./paper2md.py ../paper2md.py 2>/dev/null \
 
 Entry point is `paper2md.py`. It needs **pylatexenc** (`pip install pylatexenc`, 2.11 is fine) — the project's only runtime dependency, used for LaTeX structure scanning (nesting-aware `\begin`/`\end` matching, brace matching, comment stripping) and for turning accent constructs into Unicode. Nothing else is needed to convert; verification additionally wants `npm install katex` (step 5) and Node on `PATH`.
 
+Two more scripts sit alongside it, each needed only on the path that uses it:
+
+| Script | For | Needs |
+|---|---|---|
+| `verify.py` | every conversion (step 5) | `katex` + Node |
+| `srcdiff.py` | comparing the output against the source (step 5) | `pdftotext` **or** `pypdf` for a PDF; `pypdfium2` + `tesseract` for a scan |
+| `pdfpages.py` | deciding what kind of PDF you have, and reading a scan (step 2) | `pypdfium2` |
+
+A `.tex` conversion needs none of the PDF-side dependencies. `srcdiff.py --mode tex` reuses `paper2md`'s own stripping primitives, so it needs nothing `paper2md.py` does not already.
+
 If the repo is unreachable and no local copy exists, the design is specified below well enough to rebuild — but prefer the real thing, which has been tested end to end (`python3 scripts/test_paper2md.py`).
 
 ## 2. Find the source, and compile it
 
 List the whole folder first: people hand over a PDF while the `.tex` sits beside it. Preference is `.tex` > `.docx` (use the `docx` skill) > PDF alone (use the `pdf` skill, and expect to repair ligatures, hyphenation and two-column reflow).
+
+If it is a PDF, establish which kind before planning anything, because there are two and they are different jobs:
+
+```bash
+python3 pdfpages.py paper.pdf --info
+```
+
+A **text-layer PDF** extracts, so the reflow-and-repair route above applies. An **image-only PDF** — a scan; `--info` says so and reports 0 characters a page — extracts nothing. There is no input for `paper2md.py`, so steps 3 and 4 do not happen at all: no conversion, no flag manifest, and none of the guarantees either of those provide. What replaces them is reading the pages yourself:
+
+```bash
+python3 pdfpages.py paper.pdf --pages 1-6 --dpi 200 -o pages/     # read these
+python3 pdfpages.py paper.pdf --pages 4 --band 0.22-0.40 --dpi 400 -o pages/
+```
+
+Render the whole page to read it, then re-render a `--band` slice at 400 dpi wherever a subscript or a sign is not certain — guessing at 200 dpi is how a transcription acquires errors that nothing downstream will catch. Transcribe as printed and never silently correct the authors' own typos; a scan is old enough that it usually has some. Then verify with `srcdiff.py --mode ocr` (step 5), which on this path is not optional: it is the only check that compares what you wrote against what the paper says.
 
 Then **compile the paper**, because `.aux` and `.bbl` are what make the conversion exact:
 
@@ -113,9 +138,18 @@ It runs four checks and exits non-zero if any fails:
 
 `--outline` prints the heading tree; check the numbering against the PDF and that the appendices survived. `--require-math` turns a skipped KaTeX check into a failure, for CI.
 
-Still manual, and the one that catches silent omission:
+Then the check that catches silent omission, which none of the above can: **nothing above compares the Markdown to the paper.** Every check in `verify.py` is about the Markdown's internal form, and all of them pass over a dropped paragraph. That comparison is `srcdiff.py`:
 
-- **No content lost.** Word-frequency diff the Markdown prose against the source, both directions. Strip fenced blocks and math from the Markdown side; strip comments, `tikzpicture` bodies, and the *arguments* of `\label`/`\ref`/`\cite`/`\begin` from the `.tex` side, or label names like `main_theorem_classical` masquerade as prose. Against a PDF instead of a `.tex`, strip the page markers and running page numbers, and expect PDF line-break hyphenation (`corre-`/`lation`) to show up as a diff on both sides.
+```bash
+python3 srcdiff.py paper.md --source paper.tex     # or paper.pdf; mode auto-detected
+python3 verify.py paper.md --source paper.tex      # same thing, folded into the report
+```
+
+It word-frequency diffs the prose both directions and strips each side the way that side needs: for `.tex`, comments, macro definitions, math environments and the *arguments* of `\label`/`\ref`/`\cite`/`\begin` (or label names like `main_theorem_classical` masquerade as prose); for a text-layer PDF, `pdftotext -layout` minus running heads and page numbers; for a scan, tesseract over rendered pages. Unmatched words are reported with their page and surrounding text.
+
+It reports rather than passes or fails, because the noise floor is real and mode-dependent — on the three papers it was built against: **0** unmatched words from a `.tex`, **0** from a text-layer PDF, **8** from a 1994 scan, all eight visibly equation debris (`abort` for a set-off `\alpha J_{k,n-k}`). Read what it prints; don't count it.
+
+Two classes of hit are expected and are not defects. Words LaTeX generates rather than the author typing them (`Abstract`, `Figure`) show up as Markdown-only. So do author names a `.bst` rendered from a `\citet` key — which is the `citet-manual` flag arriving on its own, and still wants checking against the PDF.
 
 A pandoc differential (`pandoc -f latex -t markdown`) is available as a third opinion, but it is largely redundant now that prose is a pass-through: pandoc drops all figures, flattens theorem environments, loses equation and citation numbering, and leaks `\label` names and `\color` markup into the text. Reach for it only when something looks reordered.
 
@@ -129,4 +163,4 @@ A single `tikzpicture` containing several `\begin{scope}` blocks (a common way t
 
 ## Reporting back
 
-Say which source you converted from (and that you checked for `.tex` before settling for a PDF), that you compiled for `.aux`/`.bbl`, how figures are represented, and the verification results **as counts, not adjectives** — "13 display and 513 inline expressions parse, zero escaping violations, one flag outstanding". Flag any normalisation applied to the author's own text, with source line numbers, and never silently fix their typos.
+Say which source you converted from (and that you checked for `.tex` before settling for a PDF — and, for a PDF, whether it had a text layer at all), that you compiled for `.aux`/`.bbl`, how figures are represented, and the verification results **as counts, not adjectives** — "13 display and 513 inline expressions parse, zero escaping violations, one flag outstanding, `srcdiff` clean in both directions". If you did not run the source comparison, say that instead of implying the checks that did run covered it. Flag any normalisation applied to the author's own text, with source line numbers, and never silently fix their typos.
