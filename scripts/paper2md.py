@@ -1181,9 +1181,6 @@ class Converter:
         s = self._close_heading(s)
 
         # footnotes
-        def fn(m):
-            body, _ = balanced(s2[0], m.end() - 1)
-            return ""
         out, i = [], 0
         while True:
             m = re.search(r"\\footnote\s*\{", s[i:])
