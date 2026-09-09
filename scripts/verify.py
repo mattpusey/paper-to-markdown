@@ -104,9 +104,28 @@ def check_escaping(md):
             n == 0)
 
 
+EQ_CAP_RE = re.compile(r"\*\*Equation\s+([\w.]+?):", re.I)
+
 def check_equations(md):
-    """\\tag{} continuity. Tags may be numeric (7) or sectioned (2.2, A.1)."""
-    tags = re.findall(r"\\tag\{([^}]*)\}", md)
+    """\\tag{} continuity. Tags may be numeric (7) or sectioned (2.2, A.1).
+
+    A diagram-as-equation (a tikzpicture typeset inside an equation/align
+    body -- routine in categorical-quantum-mechanics papers) is not valid
+    KaTeX, so it is rendered as a fenced node/edge block with a
+    "**Equation N:**" header instead of "$$...$$\\tag{N}" -- the same move
+    already made for "**Figure N:**"/"**Table N:**". Its number still has to
+    count for gap detection, or every paper with diagram equations reports
+    a spurious wall of gaps for numbers that are not missing at all, just
+    not spelled \\tag{}.
+    """
+    # Merged in DOCUMENT ORDER by position, not "all \tag{}s then all
+    # **Equation N:** headers" -- concatenating the two findall() lists
+    # outright interleaves two independently-ordered sequences into one and
+    # reports the seam between them as a bogus ascending-order failure,
+    # even when each is individually in order.
+    matches = ([(m.start(), m.group(1)) for m in re.finditer(r"\\tag\{([^}]*)\}", md)]
+               + [(m.start(), m.group(1)) for m in EQ_CAP_RE.finditer(md)])
+    tags = [t for _, t in sorted(matches)]
     numeric, other, dupes, seen = [], [], [], set()
     for t in tags:
         t = t.strip()

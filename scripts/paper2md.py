@@ -85,25 +85,54 @@ def _walker(s):
     return LatexWalker(s, tolerant_parsing=True)
 
 
+_VERB_RE = re.compile(r"\\verb\*?(.)")
+
 def balanced(s, i, open_ch="{", close_ch="}"):
     """s[i] must be open_ch. Return (content, index_after_close).
 
-    Delimiter matching is LatexWalker's, so a brace inside a % comment or a
-    \\verb argument cannot throw the count off.
+    Plain character-level brace counting -- NOT LatexWalker's structural
+    parse. This used to delegate to get_latex_expression()/
+    get_latex_maybe_optional_arg() so a brace inside a % comment or a \\verb
+    argument could not throw the count off, but that also makes LatexWalker
+    treat a bare \\begin{X} found INSIDE the group as a real environment
+    opener, and hunt forward past the group's own closing brace for a
+    matching \\end{X} -- which does not have to exist anywhere near it.
+    \\newcommand{\\bit}{\\begin{itemize}} is exactly this: 'itemize' only
+    ever closes inside \\eit's body, a DIFFERENT \\newcommand possibly many
+    lines later, so get_latex_expression() silently absorbed everything
+    between the two into \\bit's "body". Counting braces by hand has no
+    opinion about \\begin/\\end at all, so a group that merely CONTAINS one
+    of those tokens -- without being expected to balance it -- is handled
+    correctly; comments and \\verb are still skipped by hand so a brace
+    inside either still cannot desync the count.
     """
     if i >= len(s) or s[i] != open_ch:
         return None, i
-    try:
-        w = _walker(s)
-        if open_ch == "{":
-            node, pos, ln = w.get_latex_expression(pos=i)
-        else:
-            node, pos, ln = w.get_latex_maybe_optional_arg(pos=i)
-    except Exception:
-        return None, i
-    if node is None or not isinstance(node, LatexGroupNode) or ln < 2:
-        return None, i
-    return s[pos + 1:pos + ln - 1], pos + ln
+    n = len(s)
+    depth, j = 0, i
+    while j < n:
+        c = s[j]
+        if c == "\\":
+            m = _VERB_RE.match(s, j)
+            if m:
+                delim = m.group(1)
+                end = s.find(delim, m.end())
+                j = end + 1 if end != -1 else n
+                continue
+            j += 2
+            continue
+        if c == "%":
+            k = s.find("\n", j)
+            j = n if k == -1 else k + 1
+            continue
+        if c == open_ch:
+            depth += 1
+        elif c == close_ch:
+            depth -= 1
+            if depth == 0:
+                return s[i + 1:j], j + 1
+        j += 1
+    return None, i
 
 
 def grab_args(s, i, n):
@@ -174,6 +203,26 @@ def drop_cmd_arg(s, name, nargs=1):
         if args is None:
             continue
         out.append(s[i:m.start()])
+        i = after
+    out.append(s[i:])
+    return "".join(out)
+
+
+def unwrap_trailing_arg(s, name, nargs):
+    """Replace \\name{a1}...{an} with just an: a color-wrapper command
+    (\\textcolor{color}{text}, \\colorbox{color}{text},
+    \\fcolorbox{border}{fill}{text}) is invisible in the compiled PDF, so
+    dropping the command but keeping its last argument is the same move
+    --drop-color already makes for a bare \\color{...} declaration."""
+    out, i = [], 0
+    for m in re.finditer(r"\\%s\s*(?=\{)" % name, s):
+        if m.start() < i:
+            continue
+        args, after = grab_args(s, m.end(), nargs)
+        if args is None:
+            continue
+        out.append(s[i:m.start()])
+        out.append(args[-1])
         i = after
     out.append(s[i:])
     return "".join(out)
@@ -319,6 +368,71 @@ def decode_accents(s):
 
 
 # --------------------------------------------------------------------------
+# \input / \include / tikzit-style figure files
+# --------------------------------------------------------------------------
+#
+# A paper's preamble macros, tikz styles and diagrams are routinely split
+# across files -- \input{preamble}, \input{defs.tex} pulling in a \newcommand
+# soup, and the common "tikzit" workflow (\tikzfig{path}, from tikzfig.sty:
+# \InputIfFileExists{path.tikz}{}{...}) that stores every diagram as its own
+# path.tikz file. pdflatex resolves all of this at compile time; a converter
+# reading only the one .tex file handed to it would see a document with its
+# own preamble macros and every \tikzfig'd diagram silently missing -- macro
+# harvesting never reaches \input'd content, and an unresolved \tikzfig call
+# is just an opaque macro invocation, never a tikzpicture to extract.
+
+_INPUT_RE = re.compile(r"\\(input|include)\s*\{([^{}]*)\}")
+_TIKZFIG_RE = re.compile(r"\\(tikzfig|ctikzfig|inlinetikzfig)\s*\{([^{}]*)\}")
+
+def _find_tex_file(base_dir, name):
+    for c in ((name,) if name.endswith(".tex") else (name, name + ".tex")):
+        p = os.path.join(base_dir, c)
+        if os.path.exists(p):
+            return p
+    return None
+
+def _find_tikz_file(base_dir, name):
+    for c in (name + ".tikz", os.path.join("figures", name + ".tikz")):
+        p = os.path.join(base_dir, c)
+        if os.path.exists(p):
+            return p
+    return None
+
+def resolve_includes(text, base_dir, seen=None):
+    """Inline \\input/\\include files and tikzit-style \\tikzfig diagrams,
+    recursively, before any other pass runs."""
+    seen = set() if seen is None else seen
+
+    def do_input(m):
+        name = m.group(2).strip()
+        path = _find_tex_file(base_dir, name)
+        if path is None:
+            flag("input-missing",
+                 f"\\{m.group(1)}{{{name}}} — file not found under {base_dir}; "
+                 f"content from it is missing from the conversion", m.group(0))
+            return ""
+        rp = os.path.realpath(path)
+        if rp in seen:
+            flag("input-cycle",
+                 f"\\{m.group(1)}{{{name}}} — include cycle detected, skipped",
+                 m.group(0))
+            return ""
+        sub = strip_comments(open(path, encoding="utf-8", errors="replace").read())
+        return resolve_includes(sub, os.path.dirname(path) or ".", seen | {rp})
+
+    def do_tikzfig(m):
+        cmd, name = m.group(1), m.group(2).strip()
+        path = _find_tikz_file(base_dir, name)
+        if path is None:
+            return m.group(0)   # left as-is; surfaces as a normal unresolved macro
+        body = strip_comments(open(path, encoding="utf-8", errors="replace").read())
+        return "\\begin{center}\n%s\n\\end{center}" % body if cmd == "ctikzfig" else body
+
+    text = _INPUT_RE.sub(do_input, text)
+    text = _TIKZFIG_RE.sub(do_tikzfig, text)
+    return text
+
+# --------------------------------------------------------------------------
 # preamble harvesting
 # --------------------------------------------------------------------------
 
@@ -331,6 +445,11 @@ BUILTIN_MACROS = {
     r"\smashoperator": (1, r"#1"),
     r"\mathrlap": (1, r"#1"),
     r"\mathllap": (1, r"#1"),
+    # amsthm's pre-environment proof macros (still provided alongside
+    # \begin{proof}/\end{proof} for backward compatibility, and some papers
+    # use them directly instead of the environment)
+    r"\proof": (0, r"\begin{proof}"),
+    r"\endproof": (0, r"\end{proof}"),
 }
 
 class Preamble:
@@ -409,6 +528,15 @@ class Preamble:
             if body is not None:
                 self.tikz_styles.setdefault(m.group(1), body.strip())
 
+        # \tikzstyle{name}=[...] -- the older pre-tikzset way of naming a
+        # style, still common (a name here can contain a space, e.g.
+        # "small box", "right label" -- exactly the multi-word style names a
+        # node then selects with \node[style={small box}]).
+        for m in re.finditer(r"\\tikzstyle\{([^}]*)\}\s*=\s*(?=\[)", s):
+            body, _ = balanced(s, m.end(), "[", "]")
+            if body is not None:
+                self.tikz_styles.setdefault(m.group(1), body.strip())
+
         # \newtheorem{env}{Display}
         for m in re.finditer(r"\\newtheorem\s*\*?\s*\{(\w+)\}(?:\[\w+\])?\s*\{([^}]*)\}", s):
             self.theorems[m.group(1)] = m.group(2)
@@ -429,6 +557,32 @@ class Preamble:
 # --------------------------------------------------------------------------
 # macro expansion
 # --------------------------------------------------------------------------
+
+# A zero-arg macro whose body IS a bare environment delimiter is a common
+# personal shorthand -- \newcommand{\beq}{\begin{equation}} / \eeq ->
+# \end{equation}\par\noindent, and the \ben/\een, \bit/\eit, \beqa/\eeqa
+# equivalents. do_figures/do_table_floats/do_math all locate environments
+# via pylatexenc's LatexWalker, which matches literal "\begin{...}"/
+# "\end{...}" tokens -- a \beq invocation looks like nothing to it, so an
+# unexpanded \beq...\eeq block is invisible to every structural pass and
+# leaks raw into the output (no numbering, no math wrapping, no tikz
+# extraction). Expanding just these macros before the structural passes
+# fixes that; general macro expansion still runs later, unchanged.
+_ENV_MACRO_RE = re.compile(r"^\s*\\(?:begin|end)\{[\w*]+\}")
+
+def expand_env_macros(body, macros):
+    env_macros = {name: bodytext for name, (nargs, bodytext) in macros.items()
+                  if nargs == 0 and _ENV_MACRO_RE.match(bodytext)}
+    if not env_macros:
+        return body
+    names = sorted(env_macros, key=len, reverse=True)
+    pattern = re.compile("|".join(re.escape(n) + r"\b" for n in names))
+    for _ in range(4):
+        new = pattern.sub(lambda m: env_macros[m.group(0)], body)
+        if new == body:
+            break
+        body = new
+    return body
 
 _ARG_RE = re.compile(r"#(\d)")
 
@@ -748,32 +902,79 @@ NODE_RE = re.compile(r"\\node\s*(?:\[([^\]]*)\])?\s*\(([^)]*)\)\s*(?:at\s*\(([^)
 EDGE_RE = re.compile(
     r"\\(?:draw|path)\s*(?:\[([^\]]*)\])?\s*\(([^)]*)\)\s*"
     r"(--|to)\s*(?:\[[^\]]*\])?\s*\(([^)]*)\)\s*;")
+FILLDRAW_RE = re.compile(r"\\filldraw\s*(?=\[)")
 SAFE_CMDS = {"node", "draw", "path", "coordinate", "begin", "end", "tikzset", "centering"}
 
 def convert_tikz(src, styles, style_map, fig_id):
     """Return (block_text, ok) for one tikzpicture body."""
-    nodes, edges = [], []
+    nodes, edges, consumed = [], [], []
     for m in NODE_RE.finditer(src):
-        label, _ = balanced(src, m.end() - 1)
+        label, after = balanced(src, m.end() - 1)
+        consumed.append((m.start(), after if label is not None else m.end()))
         stylelist = [x.strip() for x in (m.group(1) or "").split(",") if x.strip()]
         prim = None
         for st in stylelist:
-            base = st.split("=")[0].strip()
+            # TikZiT-generated diagrams (the norm in this literature) write
+            # the style name as \node[style=NAME], not bare \node[NAME] --
+            # the key here is the literal word "style", not the style's own
+            # name, so splitting on "=" and taking [0] found "style" every
+            # time and no node was ever recognised as styled.
+            if st.startswith("style="):
+                base = st[len("style="):].strip().strip("{}").strip()
+            else:
+                base = st.split("=")[0].strip()
             if base in styles or base in style_map:
                 prim = base; break
         lab = (label or "").strip()
         lab = re.sub(r"^\$(.*)\$$", r"\1", lab).strip()
         nodes.append({"name": m.group(2).strip(), "label": lab, "style": prim})
     for m in EDGE_RE.finditer(src):
+        consumed.append((m.start(), m.end()))
         a, b = m.group(2).strip(), m.group(4).strip()
         if a.startswith("$") or b.startswith("$"):
             continue  # computed coordinate, not a real endpoint
         directed = "->" in (m.group(1) or "")
         edges.append((a, b, directed))
 
-    # anything we did not consume that looks structural?
-    residue = NODE_RE.sub(" ", src)
-    residue = EDGE_RE.sub(" ", residue)
+    # \filldraw[fill=COLOR,draw=...] (n1.center) to (n2.center) to ... to
+    # cycle; draws a filled polygon over a group of node anchors -- in this
+    # literature it is always a shaded highlight/background behind part of
+    # the diagram (a "this sub-box is being called out" visual), never a
+    # node in its own right. Every instance in this paper follows exactly
+    # this shape, so it is worth recognising structurally rather than
+    # leaving it as a per-figure "check by hand" flag: extract the fill
+    # colour and the anchors it spans so the shading survives as a line of
+    # text instead of disappearing (or being misread as an unparsed
+    # command).
+    shades = []
+    for m in FILLDRAW_RE.finditer(src):
+        opts, after_opts = balanced(src, m.end(), "[", "]")
+        if opts is None:
+            continue
+        semi = src.find(";", after_opts)
+        if semi == -1:
+            continue
+        path = src[after_opts:semi]
+        refs = [r.strip() for r in re.findall(r"\(([^)]*)\)", path)]
+        refs = [r for r in refs if r]
+        if not refs:
+            continue
+        fill_m = re.search(r"fill\s*=\s*([^,\]]+)", opts)
+        fill = fill_m.group(1).strip() if fill_m else "shaded"
+        shades.append((fill, refs))
+        consumed.append((m.start(), semi + 1))
+
+    # anything we did not consume that looks structural? Blank out the FULL
+    # matched span for each \node/\draw -- for a \node this must include the
+    # label body (balanced() found it separately from NODE_RE's own match,
+    # which only extends to the label's opening brace), or every math command
+    # inside an ordinary node label (\widetilde, \tau, ...) reads as an
+    # "unhandled TikZ command" even though it was already captured above.
+    residue = list(src)
+    for a, b in consumed:
+        for idx in range(a, min(b, len(residue))):
+            residue[idx] = " "
+    residue = "".join(residue)
     unknown = set(re.findall(r"\\([A-Za-z]+)", residue)) - SAFE_CMDS
     ok = True
 
@@ -840,6 +1041,14 @@ def convert_tikz(src, styles, style_map, fig_id):
                  f"{styles.get(n['style'], '?')}", "")
 
     name2label = {n["name"]: (n["label"] or n["name"]) for n in nodes}
+    def endpoint_label(ref):
+        # An edge endpoint is often "5.center" or "5.north east" -- an
+        # anchor ON node 5, not a node in its own right. Resolving only the
+        # bare id still finds 5's real label; without this every edge
+        # touching a coordinate anchor (the common case: TikZ wiring is
+        # mostly done through invisible "none"-style anchor nodes) printed
+        # the raw "5.center" instead of the label that node was given.
+        return name2label.get(ref.split(".", 1)[0].strip(), ref)
     lines = [f"{fig_id}", "Nodes:"]
     for key, group in by_style.items():
         labels = ", ".join(n["label"] or n["name"] for n in group)
@@ -847,7 +1056,12 @@ def convert_tikz(src, styles, style_map, fig_id):
     lines.append("Edges:")
     for a, b, directed in edges:
         arrow = "->" if directed else "--"
-        lines.append(f"  {name2label.get(a, a)} {arrow} {name2label.get(b, b)}")
+        lines.append(f"  {endpoint_label(a)} {arrow} {endpoint_label(b)}")
+    if shades:
+        lines.append("Shaded regions:")
+        for fill, refs in shades:
+            labels = ", ".join(dict.fromkeys(endpoint_label(r) for r in refs))
+            lines.append(f"  [{fill}] spans {labels}")
     return "\n".join(lines), ok
 
 # --------------------------------------------------------------------------
@@ -1000,6 +1214,101 @@ class Converter:
             return "\n\n" + cap_md + "\n" + inner.strip() + "\n\n"
         return replace_envs(s, {"table", "table*"}, one)
 
+    def _inline_math_segment(self, text, label):
+        """Wrap a scrap of math text (whatever sits between/around a
+        diagram inside an equation) as inline $...$ and stash it -- this
+        must be stash()ed here rather than left as raw "$...$" text for
+        _stash_math() to find later: a diagram equation reached via \\[...\\]
+        is rendered FROM WITHIN _stash_math()'s own single walk over the
+        document, so there is no later pass that will ever see this "$"
+        again to protect it.
+
+        Also guards against a dangling backslash at the end combining with
+        the closing $ into an ESCAPED dollar sign (\\$) rather than a real
+        delimiter. This is not a rare edge case here: a "\\ " control-space
+        right before \\begin{tikzpicture} (forcing a gap before the diagram)
+        survives .strip() as a bare trailing backslash once its space is
+        gone -- and it does not matter whether an even or odd number of
+        backslashes precede the $: "\\\\$" reads as "\\" (a real command,
+        e.g. a line break) immediately followed by an escaped dollar just as
+        readily as a lone "\\$" does, since the escape is a property of the
+        LAST backslash touching the $, not of how many came before it. An
+        escaped $ isn't a delimiter, so the real closing $ becomes whatever
+        unescaped $ comes along next in the DOCUMENT -- silently swallowing
+        every paragraph in between (refs, citations, prose) into one bogus
+        math span that never reaches do_text().
+
+        Returns None if there is nothing left to show (trailing backslashes
+        with no other content trim down to the empty string) -- the caller
+        must drop it rather than emit "$$", which -- sitting alone on its
+        own line, same as every real display-math delimiter -- would desync
+        every display-math open/close after it for the rest of the document.
+        """
+        # A scrap of math copied straight from the source often still has
+        # its original line breaks (e.g. "= \Pr(E,P) \in [0,1]\n." from a
+        # two-line \tikeq call). $...$ spanning a literal newline is fragile
+        # -- some Markdown renderers, and this tool's own escaping-regime
+        # scan, only look for the closing $ on the SAME line -- and there is
+        # no display-math reason to keep the break, so it collapses to a
+        # single space like any other run of whitespace would.
+        text = re.sub(r"\s+", " ", text).strip()
+        # Peel trailing backslash-tokens one at a time: source text often
+        # has SEVERAL of them back to back with only whitespace between
+        # ("\ \" -- a control-space then a bare line-continuation "\"), and
+        # stripping just once leaves the next one exposed as the new
+        # trailing backslash. Loop until a pass changes nothing.
+        while True:
+            trimmed = text.rstrip().rstrip("\\")
+            if trimmed == text:
+                break
+            text = trimmed
+        if not text:
+            return None
+        if text.count("\\left") != text.count("\\right"):
+            flag("equation-diagram-split-delimiter",
+                 f"{label}: '\\left'/'\\right' unbalanced in the math "
+                 f"surrounding a diagram (split across the fence boundary) "
+                 f"— KaTeX will reject it; fix by hand", text)
+        return self.stash("$%s$" % text)
+
+    # ---- diagram equations ----
+    def _render_diagram_equation(self, inner, eq_num):
+        """A math environment whose body contains a raw tikzpicture is not
+        an equation KaTeX can render -- \\node/\\draw are not math syntax --
+        it is a string-diagram identity typeset AS an equation (routine in
+        categorical-quantum-mechanics papers: "diagram A = diagram B").
+        Wrapping the whole body in $$...$$ (as an ordinary equation) would
+        dump raw TikZ source as "math", so instead split it the way a
+        figure's tikzpicture is split: each picture becomes a node/edge
+        fenced block via convert_tikz, and whatever math sits between/around
+        the pictures (an "=", a "\\mapsto", a trailing scalar condition)
+        stays inline math. Returns None (handle as an ordinary equation) if
+        there is no tikzpicture in here at all.
+        """
+        pics = env_spans(inner, {"tikzpicture"})
+        if not pics:
+            return None
+        label = f"EQUATION {eq_num}" if eq_num else "EQUATION"
+        parts, i = [], 0
+        for k, (pnode, _anc) in enumerate(pics):
+            before = inner[i:pnode.pos].strip()
+            if before:
+                seg = self._inline_math_segment(before, label)
+                if seg is not None:
+                    parts.append(seg)
+            sub_id = label + (f"({chr(97 + k)})" if len(pics) > 1 else "")
+            blk, _ = convert_tikz(inner[pnode.pos:pnode.pos + pnode.len],
+                                   self.pre.tikz_styles, self.args.style_map, sub_id)
+            parts.append("```\n%s\n```" % blk)
+            i = pnode.pos + pnode.len
+        tail = inner[i:].strip()
+        if tail:
+            seg = self._inline_math_segment(tail, label)
+            if seg is not None:
+                parts.append(seg)
+        head = f"**Equation {eq_num}:**\n\n" if eq_num else ""
+        return "\n\n" + head + "\n\n".join(parts) + "\n\n"
+
     # ---- math ----
     def do_math(self, s):
         # Display environments, visited in ONE walk so they come in document
@@ -1015,15 +1324,36 @@ class Converter:
                 env = node.environmentname
                 starred = env.endswith("*")
                 env = env[:-1] if starred else env
+                if starred:
+                    inner = re.sub(r"\\nonumber|\\notag", "", inner)
+                    diagram = self._render_diagram_equation(inner, None)
+                    if diagram is not None:
+                        return diagram
+                    if env in ("multline", "gather", "eqnarray", "align"):
+                        inner = "\\begin{aligned}%s\\end{aligned}" % inner
+                    return self.stash("$$\n%s\n$$" % inner.strip())
+
+                # align/gather/eqnarray number EVERY ROW by default in real
+                # LaTeX (unlike equation/multline, which are one number
+                # regardless of how many \\-separated lines they contain) --
+                # unless a row carries \nonumber/\notag. A row with its own
+                # tikzpicture still gets the figure-like single-number
+                # treatment (matching how a figure is captioned once, not
+                # per sub-panel) -- _render_multirow_align() decides that
+                # per ROW, not for the block as a whole, so a diagram row
+                # sitting next to plain math rows doesn't swallow their
+                # numbers too.
+                if env in ("align", "gather", "eqnarray"):
+                    return self._render_multirow_align(inner, anc, env)
+
                 labs = re.findall(r"\\label\s*\{([^}]*)\}", inner)
                 tag = ""
-                if starred:
-                    # \begin{equation*} etc. are unnumbered in LaTeX too
-                    pass
-                elif labs:
+                eq_num = None
+                if labs:
                     num = self.labels.get(labs[0])
                     if num:
                         tag = "\n\\tag{%s}" % num
+                        eq_num = num
                         self.eq_last = num
                     else:
                         flag("equation-unnumbered",
@@ -1045,6 +1375,7 @@ class Converter:
                     derived = next_eq_number(prev, "subequations" in anc)
                     if derived:
                         tag = "\n\\tag{%s}" % derived
+                        eq_num = derived
                         self.eq_last = derived
                         flag("equation-derived-number",
                              f"unlabelled {env} numbered {derived}, continuing from {prev}. "
@@ -1055,13 +1386,139 @@ class Converter:
                              f"unlabelled {env} and no previous number to continue from — "
                              f"equation emitted without a number", inner)
                 inner = re.sub(r"\\label\s*\{[^}]*\}", "", inner)
-                inner = re.sub(r"\\nonumber", "", inner)
+                inner = re.sub(r"\\nonumber|\\notag", "", inner)
+                diagram = self._render_diagram_equation(inner, eq_num)
+                if diagram is not None:
+                    return diagram
                 if env in ("multline", "gather", "eqnarray", "align"):
                     inner = "\\begin{aligned}%s\\end{aligned}" % inner
                 return self.stash("$$\n%s%s\n$$" % (inner.strip(), tag))
             s = replace_envs(s, names, rep)
         s = re.sub(r"\\(?:begin|end)\{subequations\}", "", s)
         return self._stash_math(s)
+
+    @staticmethod
+    def _split_display_rows(inner):
+        """Split a display-math body on top-level "\\\\" row separators
+        (LaTeX's own row break), skipping over one inside a brace group so
+        a nested \\begin{matrix}...\\\\...\\end{matrix} doesn't fragment.
+        """
+        rows, depth, cur, i, n = [], 0, [], 0, len(inner)
+        while i < n:
+            c = inner[i]
+            if c == "\\" and inner[i:i + 2] == "\\\\" and depth == 0:
+                rows.append("".join(cur))
+                cur = []
+                i += 2
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth = max(0, depth - 1)
+            cur.append(c)
+            i += 1
+        rows.append("".join(cur))
+        return rows
+
+    def _render_multirow_align(self, inner, anc, env):
+        """align/gather/eqnarray number every \\\\-separated row by default
+        in real LaTeX -- \\nonumber/\\notag is what OPTS a row out, not the
+        other way around. Treating the whole block as one $$...$$\\tag{} (as
+        the plain equation/multline path does) silently drops every number
+        but the first row's, and every later unlabelled equation in the
+        document then derives from the wrong baseline -- a four-number
+        undercount from one five-row align is enough to misnumber every
+        unlabelled equation for the rest of the paper.
+
+        A row containing its own tikzpicture is rendered through
+        _render_diagram_equation() individually -- a diagram interleaved
+        with OTHER rows in one align is still one row with its own number,
+        not license to fold the whole block into a single figure-like
+        unit -- which also breaks it out of the shared $$\\begin{aligned}
+        block (KaTeX math can't contain one), closing that block before the
+        diagram and opening a fresh one for whatever rows follow. The row's
+        own "&" alignment marks are dropped in that case: they format columns
+        against sibling ALIGNED rows, which a diagram row -- rendered as a
+        fenced block, not math -- no longer has.
+        """
+        rows = self._split_display_rows(inner)
+
+        # \label placed on a \nonumber row -- routinely how a paper marks up
+        # \begin{align}\label{X} right at the top, with the actual numbered
+        # row coming later once the \nonumber rows above it are done -- does
+        # not describe THAT row (LaTeX never assigns it a number, so \label
+        # there could not sensibly ref that row); move it onto the next row
+        # that isn't itself \nonumber, which is where the real numbering (and
+        # the label's real target) actually lands.
+        pending = []
+        for i, row in enumerate(rows):
+            if re.search(r"\\nonumber\b|\\notag\b", row):
+                found = re.findall(r"\\label\s*\{([^}]*)\}", row)
+                if found:
+                    rows[i] = re.sub(r"\\label\s*\{[^}]*\}", "", row)
+                    pending.extend(found)
+            elif pending:
+                rows[i] = "".join("\\label{%s}" % l for l in pending) + rows[i]
+                pending = []
+
+        in_sub = "subequations" in anc
+        parts, group = [], []
+
+        def flush_group():
+            if group:
+                parts.append(self.stash(
+                    "$$\n\\begin{aligned}%s\\end{aligned}\n$$" % "\\\\\n".join(group)))
+                group.clear()
+
+        for row in rows:
+            labs = re.findall(r"\\label\s*\{([^}]*)\}", row)
+            nonum = bool(re.search(r"\\nonumber\b|\\notag\b", row))
+            tag = ""
+            eq_num = None
+            if labs:
+                num = self.labels.get(labs[0])
+                if num:
+                    tag = " \\tag{%s}" % num
+                    eq_num = num
+                    self.eq_last = num
+                else:
+                    flag("equation-unnumbered",
+                         f"no .aux entry for equation label '{labs[0]}' — "
+                         f"row emitted without a number", row)
+                if len(labs) > 1:
+                    flag("equation-multi-label",
+                         f"one row of an {env} carries multiple labels "
+                         f"({', '.join(labs)}); only the first is used. Split "
+                         f"the row by hand if the extra labels are referenced.",
+                         row)
+            elif not nonum:
+                prev = self.eq_last
+                derived = next_eq_number(prev, in_sub)
+                if derived:
+                    tag = " \\tag{%s}" % derived
+                    eq_num = derived
+                    self.eq_last = derived
+                    flag("equation-derived-number",
+                         f"unlabelled {env} row numbered {derived}, continuing "
+                         f"from {prev}. It has no \\label, so this is derived "
+                         f"rather than read from the .aux — check it against "
+                         f"the PDF.", row)
+                else:
+                    flag("equation-unnumbered",
+                         f"unlabelled {env} row and no previous number to "
+                         f"continue from — row emitted without a number", row)
+            row = re.sub(r"\\label\s*\{[^}]*\}", "", row)
+            row = re.sub(r"\\nonumber\b|\\notag\b", "", row)
+
+            if env_spans(row, {"tikzpicture"}):
+                flush_group()
+                diagram = self._render_diagram_equation(row.replace("&", ""), eq_num)
+                parts.append(diagram if diagram is not None
+                             else self.stash("$%s$" % row.strip()))
+            else:
+                group.append(row.rstrip() + tag)
+        flush_group()
+        return "".join(parts)
 
     def _stash_math(self, s):
         r"""$...$, $$...$$, \[...\] and \(...\) -> placeholders, in ONE walk.
@@ -1095,7 +1552,16 @@ class Converter:
             inner = s[n.pos + len(open_d):n.pos + n.len - len(close_d)]
             out.append(s[i:n.pos])
             if n.displaytype == "display":
-                out.append(self.stash("$$\n%s\n$$" % inner.strip()))
+                # \[...\] (or bare $$...$$) is TeX's OTHER spelling for a
+                # display equation, and can carry the exact same
+                # diagram-as-equation pattern as \begin{equation}/\eeq --
+                # do_math()'s rep() never sees this content at all (it only
+                # walks \begin{MATH_ENV}...\end{MATH_ENV}), so without this
+                # check a raw tikzpicture here would be dumped verbatim into
+                # "$$...$$" the same way an equation-environment one used to.
+                diagram = self._render_diagram_equation(inner.strip(), None)
+                out.append(diagram if diagram is not None
+                            else self.stash("$$\n%s\n$$" % inner.strip()))
             else:
                 # $...$ is passed through verbatim, as it always was; only the
                 # \(...\) spelling was ever stripped.
@@ -1201,6 +1667,12 @@ class Converter:
         for cmd, wrap in [("emph", "*"), ("textit", "*"), ("textbf", "**"),
                           ("texttt", "`"), ("textsc", "")]:
             s = self._wrap(s, cmd, wrap)
+        # old-style bare font declarations used as a group -- {\em text}
+        # rather than \emph{text} -- activate the font for the rest of the
+        # enclosing group, so the whole {...} is the emphasized span.
+        for cmd, wrap in [("em", "*"), ("it", "*"), ("sl", "*"), ("bf", "**"),
+                          ("tt", "`"), ("sc", ""), ("rm", "")]:
+            s = self._wrap_bare_font_group(s, cmd, wrap)
 
         # lists
         s = re.sub(r"\\begin\{itemize\}", "\n", s)
@@ -1252,14 +1724,24 @@ class Converter:
         # Whatever is left takes no argument. The single regex this replaced
         # offered an optional {[^}]*} to ALL of them, so \centering followed by
         # a brace group swallowed the group -- with a whole table inside it.
+        # None of these commands have a starred variant in real LaTeX, so the
+        # optional "\*?" that used to sit here is not needed -- and is
+        # actively dangerous: "\s*\*?\s*" reaches across a blank line, so
+        # "\allowdisplaybreaks\n\n**Equation 5:**" (a real sequence: the
+        # command sits right before a diagram-equation's own bold header)
+        # consumed the FIRST "*" of the following "**", leaving a corrupted
+        # "*Equation 5:**" behind.
         s = re.sub(r"\\(?:label|nocite|bibliographystyle|bibliography|maketitle|centering"
                    r"|setlength|setcounter|addtolength|counterwithin|renewcommand"
                    r"|vspace|hspace|bigskip|medskip|smallskip|noindent|onecolumn|twocolumn"
-                   r"|appendix|FloatBarrier|center|par)\b\s*\*?\s*(\[[^\]]*\])?", "", s)
+                   r"|onecolumngrid|twocolumngrid|allowdisplaybreaks"
+                   r"|appendix|FloatBarrier|center|par)\b\s*(\[[^\]]*\])?", "", s)
         s = re.sub(r"\\begin\{(document|strip|abstract|center|subfigure)\}", "", s)
         s = re.sub(r"\\end\{(document|strip|abstract|center|subfigure)\}", "", s)
         if self.args.drop_color:
             s = re.sub(r"\\color\s*\{[^}]*\}", "", s)
+            for name, n in (("textcolor", 2), ("colorbox", 2), ("fcolorbox", 3)):
+                s = unwrap_trailing_arg(s, name, n)
         # A brace left alone on its own line is LaTeX grouping whose command has
         # just been stripped: "{\\renewcommand{\\arraystretch}{1.7} ... }" around
         # a table leaves "{" and "}" as prose. Deliberately only when it is the
@@ -1302,6 +1784,27 @@ class Converter:
             body, after = balanced(s, i + m.end() - 1)
             out.append(s[i:start])
             out.append(f"{wrap}{body}{wrap}" if body else "")
+            i = after
+        return "".join(out)
+
+    def _wrap_bare_font_group(self, s, cmd, wrap):
+        """{\\em text} -- a bare font-switching command used LaTeX's older
+        way, as the first token of a group, rather than \\emph{text}. The
+        command has no argument of its own; it just switches the font for
+        the rest of the enclosing group, so the group boundary IS the
+        wrapped span."""
+        out, i = [], 0
+        pat = re.compile(r"\{\\%s(?![A-Za-z])" % cmd)
+        while True:
+            m = pat.search(s, i)
+            if not m:
+                out.append(s[i:]); break
+            content, after = balanced(s, m.start())
+            if content is None:
+                out.append(s[i:m.end()]); i = m.end(); continue
+            out.append(s[i:m.start()])
+            inner = content[len(cmd) + 1:].strip()
+            out.append(f"{wrap}{inner}{wrap}" if inner else "")
             i = after
         return "".join(out)
 
@@ -1375,13 +1878,26 @@ def run_checks(md):
     in_fence = in_disp = False
     viol = []
     for i, ln in enumerate(lines, 1):
-        if ln.startswith("```"): in_fence = not in_fence; continue
+        # A fence or display-math delimiter INSIDE a blockquoted theorem/
+        # definition still reads "> ```" / "> $$": do_text() prefixes every
+        # line of the quoted block uniformly, boundary markers included, so
+        # the leading quote marker(s) have to be stripped before checking
+        # for one -- otherwise a diagram embedded in a theorem is never
+        # recognised as fenced and gets scanned (and flagged) as loose prose.
+        unquoted = re.sub(r"^(?:>\s?)+", "", ln)
+        if unquoted.startswith("```"): in_fence = not in_fence; continue
         if in_fence: continue
-        if re.match(r"^\$\$\s*$", ln): in_disp = not in_disp; continue
+        if re.match(r"^\$\$\s*$", unquoted): in_disp = not in_disp; continue
         if in_disp: continue
         stripped = re.sub(r"\$\$[^$]*\$\$", "", ln)   # display math on one line
         stripped = re.sub(r"\$[^$]*\$", "", stripped)
         stripped = re.sub(r"\[\^\d+\]:?", "", stripped)
+        # A markdown link's URL, e.g. [text](https://doi.org/10.1007/x_1),
+        # routinely carries a literal "_" (a normal, common DOI character);
+        # it sits inside the (...) target, never inside rendered text, so it
+        # can never trigger Markdown's emphasis parsing the way a bare "_"
+        # in prose would.
+        stripped = re.sub(r"\]\([^()\s]*\)", "]()", stripped)
         # A bare command is not always a control WORD: LaTeX's commonest accents
         # are control SYMBOLS (\"o, \'e, \~n, \=a, \.z), so a \\[A-Za-z]+ scan
         # walks straight past exactly the constructs that corrupt text silently.
@@ -1425,6 +1941,7 @@ def main():
 
     src = open(a.tex, encoding="utf-8", errors="replace").read()
     src = strip_comments(src)
+    src = resolve_includes(src, os.path.dirname(a.tex) or ".")
     if "\\begin{document}" in src:
         pre_txt, body = src.split("\\begin{document}", 1)
     else:
@@ -1473,6 +1990,8 @@ def main():
                 if not (f["kind"].startswith("macro-")
                         and (f["detail"].split()[0] in resolved
                              or f["detail"].split()[0] not in body))]
+
+    body = expand_env_macros(body, {**BUILTIN_MACROS, **pre.macros})
 
     conv = Converter(pre, labels, cite_order, a)
     body = conv.do_figures(body)

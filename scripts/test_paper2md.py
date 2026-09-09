@@ -63,6 +63,16 @@ class EscapingRegimeCheck(unittest.TestCase):
                      "```\nFIGURE 1 \\node raw\n```"]:
             self.assertEqual(self.check(good), 0, good)
 
+    def test_underscore_in_a_link_url_is_not_a_violation(self):
+        # A DOI routinely contains "_"; it sits inside the (...) target,
+        # never in rendered text, so it can't trigger emphasis parsing the
+        # way a bare "_" in prose would.
+        self.assertEqual(self.check(
+            "[65] K. Husimi, [paper](https://doi.org/10.11429/ppmsj1919.22.4_264)"), 0)
+
+    def test_underscore_in_link_text_is_still_a_violation(self):
+        self.assertEqual(self.check("see [my_var](https://example.com)"), 1)
+
 
 class Accents(unittest.TestCase):
     """\~{n} used to come out as "\\ {n}": do_text() replaced "~" with a
@@ -107,6 +117,221 @@ class Accents(unittest.TestCase):
         # the one thing left raw is the URL tilde, and it is flagged, not silent
         self.assertEqual(sorted(f["kind"] for f in flags), ["escaping-regime", "no-aux"])
         self.assertTrue(any(r"\~boyd" in f["snippet"] for f in flags))
+
+
+class TikzConversion(unittest.TestCase):
+    r"""convert_tikz() encodes a tikzpicture as a node/edge list. Two bugs
+    fixed together here made real (TikZiT-generated) diagrams come out
+    almost entirely unstyled and with garbled edges:
+
+    1. TikZiT writes \node[style=NAME], never bare \node[NAME] -- the style
+       lookup split "style=NAME" on '=' and kept [0] ("style" itself, never
+       a real style name), so no node was ever recognised as styled.
+    2. An edge endpoint is routinely a coordinate anchor on a node, e.g.
+       (5.center) or (5.north east), not the bare node id -- looking those
+       up verbatim in the name/label map always missed, so the edge list
+       showed the raw "5.center" instead of node 5's actual label.
+    """
+
+    def test_style_equals_name_is_recognised(self):
+        src = ("\\begin{tikzpicture}\n"
+               "\\node [style=point] (0) at (0,0) {$A$};\n"
+               "\\end{tikzpicture}")
+        blk, ok = paper2md.convert_tikz(src, {"point": "..."}, {"point": "state"}, "FIG")
+        self.assertIn("A   [state]", blk)
+        self.assertTrue(ok)
+
+    def test_multi_word_braced_style_name(self):
+        src = ("\\begin{tikzpicture}\n"
+               "\\node [style={small box}, minimum width={1.5 cm}] (0) at (0,0) {$T$};\n"
+               "\\end{tikzpicture}")
+        blk, _ = paper2md.convert_tikz(src, {"small box": "..."},
+                                        {"small box": "process"}, "FIG")
+        self.assertIn("T   [process]", blk)
+
+    def test_edge_to_a_center_anchor_resolves_the_nodes_own_label(self):
+        src = ("\\begin{tikzpicture}\n"
+               "\\node [style=point] (0) at (0,0) {$A$};\n"
+               "\\node [style=none] (1) at (1,0) {};\n"
+               "\\draw (0) to (1.center);\n"
+               "\\end{tikzpicture}")
+        blk, _ = paper2md.convert_tikz(src, {"point": "..."}, {"point": "state"}, "FIG")
+        self.assertIn("A -- 1", blk)
+        self.assertNotIn(".center", blk)
+
+    def test_bare_style_name_without_style_equals_still_works(self):
+        # not TikZiT's convention, but \node[NAME] (no "style=") is valid
+        # TikZ and used to be the only form this recognised -- must keep
+        # working.
+        src = ("\\begin{tikzpicture}\n"
+               "\\node [point] (0) at (0,0) {$A$};\n"
+               "\\end{tikzpicture}")
+        blk, _ = paper2md.convert_tikz(src, {"point": "..."}, {"point": "state"}, "FIG")
+        self.assertIn("A   [state]", blk)
+
+
+class TikzFilldrawShading(unittest.TestCase):
+    r"""\filldraw[fill=COLOR,...] (n.center) to (m.center) to ... to cycle;
+    draws a shaded highlight polygon over a group of node anchors. Every
+    occurrence in the wild (112 in one paper alone) followed this exact
+    shape and none carried any other content, but the extractor did not
+    recognise \filldraw at all, so each one leaked into the "unhandled TikZ
+    commands" residue check and got a generic "check the figure by hand"
+    flag instead of the shading surviving as text."""
+
+    def test_filldraw_becomes_a_shaded_region_line(self):
+        src = ("\\begin{tikzpicture}\n"
+               "\\node [style=none] (0) at (0,0) {$A$};\n"
+               "\\node [style=none] (1) at (1,0) {$B$};\n"
+               "\\filldraw[fill=green!20,draw=green!40] (0.center) to "
+               "(1.center) to cycle;\n"
+               "\\end{tikzpicture}")
+        blk, ok = paper2md.convert_tikz(src, {}, {}, "FIG")
+        self.assertTrue(ok)
+        self.assertIn("Shaded regions:", blk)
+        self.assertIn("green!20", blk)
+        self.assertIn("A, B", blk)
+
+    def test_filldraw_no_longer_flagged_as_unparsed(self):
+        src = ("\\begin{tikzpicture}\n"
+               "\\node [style=none] (0) at (0,0) {$A$};\n"
+               "\\node [style=none] (1) at (1,0) {$B$};\n"
+               "\\filldraw[fill=white,draw=black] (0.center) to "
+               "(1.center) to cycle;\n"
+               "\\end{tikzpicture}")
+        before = len(paper2md.FLAGS)
+        blk, ok = paper2md.convert_tikz(src, {}, {}, "FIG")
+        self.assertTrue(ok)
+        new_flags = paper2md.FLAGS[before:]
+        self.assertFalse(any(f["kind"] == "tikz-unparsed-commands" for f in new_flags))
+
+
+class TikzStyleHarvesting(unittest.TestCase):
+    r"""Preamble only harvested \tikzset{name/.style={...}}, missing the
+    older (and, for TikZiT-generated diagrams, near-universal)
+    \tikzstyle{name}=[...] form entirely -- every node in a paper using it
+    fell back to [unstyled], with no flag ever raised to say so."""
+
+    def test_tikzstyle_form_is_harvested(self):
+        pre = paper2md.Preamble(r"\tikzstyle{point}=[regular polygon,draw]")
+        self.assertIn("point", pre.tikz_styles)
+
+    def test_multi_word_name_with_space(self):
+        pre = paper2md.Preamble(r"\tikzstyle{small box}=[rectangle,draw]")
+        self.assertIn("small box", pre.tikz_styles)
+
+    def test_tikzset_form_still_works(self):
+        pre = paper2md.Preamble(r"\tikzset{sv/.style={fill=blue}}")
+        self.assertIn("sv", pre.tikz_styles)
+
+
+class MultirowAlign(unittest.TestCase):
+    r"""align/gather/eqnarray number EVERY \\-separated row by default in
+    real LaTeX -- \nonumber/\notag opts a row OUT, it's not opt-in. Treating
+    the whole block as a single $$...$$\tag{} (as equation/multline
+    correctly do) silently drops every row's number but the first, so every
+    later unlabelled equation in the document derives from the wrong
+    baseline. A single five-row, fully-unlabelled align in the source paper
+    this was found on undercounted every subsequent derived number by 4 for
+    the rest of the document.
+    """
+
+    def convert(self, tex, aux_labels=None):
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""), aux_labels or {}, {}, _Args())
+        before = len(paper2md.FLAGS)
+        out = conv.restore(conv.do_math(tex))
+        flags = paper2md.FLAGS[before:]
+        del paper2md.FLAGS[before:]
+        return out, flags, conv
+
+    def test_each_unlabelled_row_gets_its_own_derived_number(self):
+        tex = ("\\begin{equation}\\label{a} x = 1 \\end{equation}\n"
+               "\\begin{align}\n"
+               "y &= 2 \\\\\n"
+               "z &= 3 \\\\\n"
+               "w &= 4\n"
+               "\\end{align}")
+        out, flags, conv = self.convert(tex, {"a": "5"})
+        self.assertEqual(re.findall(r"\\tag\{([^}]*)\}", out), ["5", "6", "7", "8"])
+        self.assertEqual(conv.eq_last, "8")
+        kinds = [f["kind"] for f in flags]
+        self.assertEqual(kinds.count("equation-derived-number"), 3)
+
+    def test_nonumber_row_is_skipped(self):
+        tex = ("\\begin{equation}\\label{a} x = 1 \\end{equation}\n"
+               "\\begin{align}\n"
+               "y &= 2 \\nonumber \\\\\n"
+               "z &= 3\n"
+               "\\end{align}")
+        out, flags, conv = self.convert(tex, {"a": "5"})
+        self.assertEqual(re.findall(r"\\tag\{([^}]*)\}", out), ["5", "6"])
+        self.assertNotIn("\\nonumber", out)
+
+    def test_labelled_row_uses_the_real_number(self):
+        tex = ("\\begin{equation}\\label{a} x = 1 \\end{equation}\n"
+               "\\begin{align}\n"
+               "y &= 2 \\\\\n"
+               "z &= 3 \\label{b}\n"
+               "\\end{align}")
+        out, flags, conv = self.convert(tex, {"a": "5", "b": "40"})
+        self.assertEqual(re.findall(r"\\tag\{([^}]*)\}", out), ["5", "6", "40"])
+        self.assertEqual(conv.eq_last, "40")
+
+    def test_diagram_row_still_gets_one_number_not_per_row(self):
+        # A tikzpicture inside align/gather/eqnarray keeps the figure-like
+        # single-number treatment; per-row numbering only applies when
+        # there's no diagram to render instead.
+        tex = ("\\begin{equation}\\label{a} x = 1 \\end{equation}\n"
+               "\\begin{align}\n"
+               "\\begin{tikzpicture}\\node (0) at (0,0) {};\\end{tikzpicture}\n"
+               "\\end{align}")
+        out, flags, conv = self.convert(tex, {"a": "5"})
+        self.assertIn("**Equation 6:**", out)
+        self.assertEqual(conv.eq_last, "6")
+
+    def test_diagram_row_and_plain_math_row_each_get_their_own_number(self):
+        # The exact shape that exposed the bug: one row is a diagram
+        # identity, the NEXT row (same align, no \nonumber) is plain math
+        # continuing it ("= scalar value") -- both need their own number,
+        # not one number for the whole block.
+        tex = ("\\begin{equation}\\label{a} x = 1 \\end{equation}\n"
+               "\\begin{align}\n"
+               "\\begin{tikzpicture}\\node (0) at (0,0) {};\\end{tikzpicture}\\\\\n"
+               "&= 2\n"
+               "\\end{align}")
+        out, flags, conv = self.convert(tex, {"a": "5"})
+        self.assertIn("**Equation 6:**", out)
+        self.assertEqual(re.findall(r"\\tag\{([^}]*)\}", out), ["5", "7"])
+        self.assertEqual(conv.eq_last, "7")
+        # the diagram row's dropped "&" doesn't survive into the fenced block
+        self.assertNotIn("&", out.split("**Equation 6:**")[1].split("```")[1])
+
+    def test_label_on_top_nonumber_row_moves_to_the_actually_numbered_row(self):
+        # \begin{align}\label{X} with \nonumber on every row until the last
+        # is a real pattern (found in the source paper this was built
+        # against): \label right after \begin{align} sits, textually, in
+        # the first row -- but that row is \nonumber, so LaTeX never gives
+        # it a number, and \label{X} could not sensibly refer to it. The
+        # label has to land on the row that actually gets numbered.
+        tex = ("\\begin{equation}\\label{a} x = 1 \\end{equation}\n"
+               "\\begin{align} \\label{tomloc}\n"
+               "y = 2 \\nonumber \\\\\n"
+               "z = 3 \\nonumber \\\\\n"
+               "w = 4\n"
+               "\\end{align}")
+        out, flags, conv = self.convert(tex, {"a": "5", "tomloc": "6"})
+        self.assertEqual(re.findall(r"\\tag\{([^}]*)\}", out), ["5", "6"])
+        self.assertEqual(conv.eq_last, "6")
+        # only row "w = 4" (the numbered one) carries the tag
+        self.assertIn("w = 4 \\tag{6}", out)
+
+    def test_starred_align_rows_stay_unnumbered(self):
+        tex = "\\begin{align*}\ny &= 2 \\\\\nz &= 3\n\\end{align*}"
+        out, flags, conv = self.convert(tex)
+        self.assertNotIn("\\tag", out)
+        self.assertIsNone(conv.eq_last)
 
 
 class Nesting(unittest.TestCase):
@@ -193,6 +418,69 @@ class DollarDisplayMath(unittest.TestCase):
         self.assertEqual([f["kind"] for f in flags if f["kind"] == "escaping-regime"], [])
 
 
+class LeftoverCommandStripping(unittest.TestCase):
+    r"""do_text()'s final sweep drops layout commands that carry no content
+    (\allowdisplaybreaks, \noindent, ...). The regex used to allow an
+    optional "\*?" after the command name for a starred variant -- none of
+    these commands actually has one -- and "\s*\*?\s*" reaches across a
+    blank line, so a command sitting right before a "**bold**" heading (a
+    diagram equation's own "**Equation N:**" header, immediately following
+    \allowdisplaybreaks in the wild) ate the heading's first "*".
+    """
+
+    def strip(self, s):
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""), {}, {}, _Args())
+        return conv.do_text(s)
+
+    def test_does_not_eat_a_following_bold_heading(self):
+        out = self.strip("text.\n\\allowdisplaybreaks\n\n**Equation 5:**\n\nmore")
+        self.assertIn("**Equation 5:**", out)
+        self.assertNotIn("*Equation 5:**", out.replace("**Equation 5:**", ""))
+
+    def test_command_itself_still_removed(self):
+        out = self.strip("a \\noindent b")
+        self.assertNotIn("\\noindent", out)
+
+
+class InlineMathTrailingBackslash(unittest.TestCase):
+    r"""_inline_math_segment() must drop ANY run of trailing backslashes,
+    not just an odd count: a real "\\" line-break command sitting right
+    before the closing $ is just as much an escaped-dollar hazard as a
+    lone "\\" is, since the escape depends only on the last backslash
+    touching the $, not on how many precede it."""
+
+    def seg(self, s):
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""), {}, {}, _Args())
+        key = conv._inline_math_segment(s, "eq:x")
+        return conv.store[key] if key is not None else None
+
+    def test_odd_trailing_backslash_is_stripped(self):
+        out = self.seg(r"x = 1 \ ")
+        self.assertFalse(out.rstrip("$").endswith("\\"))
+
+    def test_even_trailing_backslash_is_also_stripped(self):
+        out = self.seg("x = 1 \\\\")
+        self.assertFalse(out.rstrip("$").endswith("\\"))
+
+    def test_content_before_backslashes_is_kept(self):
+        out = self.seg("x = 1 \\\\")
+        self.assertIn("x = 1", out)
+
+    def test_only_backslashes_yields_none(self):
+        self.assertIsNone(self.seg(" \\\\ "))
+
+    def test_multiple_separated_trailing_backslash_tokens_all_peeled(self):
+        # "\forall \tau  \ \" -- a "\ " control-space followed by a bare
+        # line-continuation "\" -- must not leave the second one behind
+        # after only the first is stripped.
+        out = self.seg("\\forall \\tau  \\ \\")
+        self.assertEqual(out, "$\\forall \\tau$")
+
+
 class TableFloats(unittest.TestCase):
     r"""\begin{table} floats were not handled: the whole float leaked into the
     Markdown as raw LaTeX and the \caption never became a caption, so every
@@ -221,6 +509,286 @@ class TableFloats(unittest.TestCase):
         self.assertEqual([f["kind"] for f in flags if f["kind"].startswith("table")],
                          ["table-derived-number"])
         self.assertEqual([f["kind"] for f in flags if f["kind"] == "escaping-regime"], [])
+
+
+class EnvShorthandMacros(unittest.TestCase):
+    r"""\newcommand{\beq}{\begin{equation}} (and \eeq/\ben/\een/\bit/\eit) is
+    a common personal shorthand. do_figures/do_table_floats/do_math locate
+    environments via pylatexenc's LatexWalker, which matches literal
+    "\begin{...}"/"\end{...}" tokens -- a \beq invocation looks like nothing
+    to it, so an unexpanded \beq...\eeq block used to be invisible to every
+    structural pass and leak raw into the output."""
+
+    def test_expands_only_bare_env_delimiter_macros(self):
+        macros = {
+            r"\beq": (0, r"\begin{equation}"),
+            r"\eeq": (0, r"\end{equation}\par\noindent"),
+            r"\ket": (1, r"|#1\rangle"),   # NOT an env macro: has an argument
+        }
+        out = paper2md.expand_env_macros(r"\beq a = b \eeq", macros)
+        self.assertEqual(out, r"\begin{equation} a = b \end{equation}\par\noindent")
+
+    def test_leaves_ordinary_macros_alone(self):
+        macros = {r"\D": (0, r"\mathcal{D}")}
+        src = r"\beq \D \eeq"
+        self.assertEqual(paper2md.expand_env_macros(src, macros), src)
+
+    def test_end_to_end_numbering_and_tikz_survive_the_shorthand(self):
+        macros = {
+            r"\beq": (0, r"\begin{equation}"),
+            r"\eeq": (0, r"\end{equation}"),
+        }
+        src = r"\beq a = b \label{eq:x} \eeq" + "\n" + r"\beq c = d \eeq"
+        body = paper2md.expand_env_macros(src, macros)
+
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""),
+                                   {"eq:x": "1"}, {}, _Args())
+        before = len(paper2md.FLAGS)
+        out = conv.restore(conv.do_math(body))
+        del paper2md.FLAGS[before:]
+        self.assertIn("\\tag{1}", out)
+        self.assertIn("\\tag{2}", out)   # derived, continuing from 1
+
+
+class BalancedBraceMatching(unittest.TestCase):
+    r"""balanced() used to delegate to LatexWalker's structural parse, which
+    treats a bare \begin{X} found INSIDE a {...} group as a real environment
+    opener and hunts forward past the group's OWN closing brace for a
+    matching \end{X} -- which does not have to be anywhere nearby.
+    \newcommand{\bit}{\begin{itemize}} is exactly this: 'itemize' only
+    closes inside a DIFFERENT \newcommand's body, possibly lines later."""
+
+    def test_dangling_begin_does_not_swallow_a_later_unrelated_command(self):
+        src = "{\\begin{itemize}}\n\\newcommand{\\eit}{\\end{itemize}}\n"
+        content, after = paper2md.balanced(src, 0)
+        self.assertEqual(content, "\\begin{itemize}")
+        self.assertEqual(src[after], "\n")
+
+    def test_ordinary_nesting_still_works(self):
+        self.assertEqual(paper2md.balanced("{a {b} c}", 0)[0], "a {b} c")
+
+    def test_comment_and_verb_braces_do_not_desync_the_count(self):
+        self.assertEqual(paper2md.balanced("{a % } stray brace\nb}", 0)[0],
+                         "a % } stray brace\nb")
+        self.assertEqual(paper2md.balanced(r"{\verb|{|x}", 0)[0], r"\verb|{|x")
+
+
+class IncludeResolution(unittest.TestCase):
+    r"""\input/\include and the tikzit \tikzfig{path} convention
+    (\InputIfFileExists{path.tikz}{}{...}) are both resolved by pdflatex at
+    compile time. A converter reading only the handed-in .tex file would
+    never see a \input'd preamble's macros, or a \tikzfig'd diagram at all."""
+
+    def test_input_is_inlined_recursively(self):
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "defs.tex"), "w") as fh:
+            fh.write(r"\newcommand{\D}{\mathcal{D}}")
+        with open(os.path.join(tmp, "preamble.tex"), "w") as fh:
+            fh.write("\\input{defs}\n")
+        out = paper2md.resolve_includes("before \\input{preamble} after", tmp)
+        self.assertIn(r"\newcommand{\D}{\mathcal{D}}", out)
+        self.assertTrue(out.startswith("before "))
+        self.assertTrue(out.endswith(" after"))
+
+    def test_missing_input_is_flagged_not_silently_dropped(self):
+        before = len(paper2md.FLAGS)
+        out = paper2md.resolve_includes("\\input{nope}", tempfile.mkdtemp())
+        kinds = [f["kind"] for f in paper2md.FLAGS[before:]]
+        del paper2md.FLAGS[before:]
+        self.assertEqual(out, "")
+        self.assertIn("input-missing", kinds)
+
+    def test_tikzfig_inlines_the_tikz_file(self):
+        tmp = tempfile.mkdtemp()
+        with open(os.path.join(tmp, "wire.tikz"), "w") as fh:
+            fh.write("\\begin{tikzpicture}\n\\node (0) at (0,0) {};\n\\end{tikzpicture}")
+        out = paper2md.resolve_includes(r"see \tikzfig{wire} here", tmp)
+        self.assertIn("\\begin{tikzpicture}", out)
+        self.assertNotIn("\\tikzfig", out)
+
+    def test_unresolved_tikzfig_is_left_alone(self):
+        out = paper2md.resolve_includes(r"\tikzfig{missing}", tempfile.mkdtemp())
+        self.assertEqual(out, r"\tikzfig{missing}")
+
+
+class DiagramEquations(unittest.TestCase):
+    r"""A math environment whose body is a raw tikzpicture is not an
+    equation KaTeX can render (\node/\draw are not math syntax) -- it is a
+    string-diagram identity typeset AS an equation, routine in
+    categorical-quantum-mechanics papers. Wrapping the whole body in
+    $$...$$ dumps raw TikZ source as "math" and corrupts everything after
+    it: the diagram's own node labels can contain a bare \$, and a "$$"
+    that never closes desyncs every display-math pair for the rest of the
+    document."""
+
+    def render(self, inner, eq_num=None):
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""), {}, {}, _Args())
+        before = len(paper2md.FLAGS)
+        out = conv._render_diagram_equation(inner, eq_num)
+        del paper2md.FLAGS[before:]
+        return out
+
+    def test_non_diagram_equation_returns_none(self):
+        self.assertIsNone(self.render(r"a = b"))
+
+    def test_tikzpicture_becomes_a_fenced_node_edge_block(self):
+        out = self.render(
+            "\\begin{tikzpicture}\n"
+            "\\node (0) at (0,0) {$A$};\n\\node (1) at (1,0) {$B$};\n"
+            "\\draw (0) to (1);\n\\end{tikzpicture}", "3")
+        self.assertIn("**Equation 3:**", out)
+        self.assertIn("```", out)
+        self.assertIn("A -- B", out)
+        self.assertNotIn("\\node", out)   # consumed, not leaked as text
+
+    def test_math_around_the_diagram_stays_inline_and_is_stashed(self):
+        out = self.render(
+            "\\exists h : \\begin{tikzpicture}\\node (0) at (0,0) {};"
+            "\\end{tikzpicture}.", "5")
+        # the surrounding math is stashed (a placeholder, not raw "$...$"),
+        # exactly so a later pass cannot swallow unrelated text into it
+        self.assertNotIn("$\\exists", out)
+        self.assertIn("\x00PM", out)
+
+    def test_trailing_bare_backslash_does_not_produce_an_empty_dollar_pair(self):
+        # "\ " (TeX control-space) right before the diagram, with its space
+        # eaten by .strip() -- must never come out as a bare "$$": that
+        # reads as an empty DISPLAY math delimiter and desyncs every
+        # display-math open/close for the rest of the document.
+        out = self.render(
+            "\\exists h \\in\\mathcal{P} : \\ \n"
+            "\\begin{tikzpicture}\\node (0) at (0,0) {};\\end{tikzpicture}", None)
+        self.assertNotIn("$$", out)
+
+    def test_internal_newline_in_the_surrounding_math_is_collapsed(self):
+        # "= \Pr(E,P) \in [0,1]\n." -- two physical lines of one inline math
+        # scrap, straight from the source. $...$ spanning a literal newline
+        # is fragile (some renderers, and this tool's own escaping-regime
+        # scan, only look for the closing $ on the same line as the opening
+        # one), and there is no reason to keep a display-math-style break in
+        # what renders as ordinary inline math.
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""), {}, {}, _Args())
+        conv._render_diagram_equation(
+            "\\begin{tikzpicture}\\node (0) at (0,0) {};\\end{tikzpicture}\n"
+            "= \\Pr(E,P) \\in [0,1]\n.", "22")
+        stashed = " ".join(v for v in conv.store.values() if isinstance(v, str))
+        self.assertIn("= \\Pr(E,P) \\in [0,1] .", stashed)
+
+    def test_unbalanced_left_right_across_the_fence_is_flagged(self):
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""), {}, {}, _Args())
+        before = len(paper2md.FLAGS)
+        conv._render_diagram_equation(
+            "\\left\\{ \\begin{tikzpicture}\\node (0) at (0,0) {};"
+            "\\end{tikzpicture}", None)
+        kinds = [f["kind"] for f in paper2md.FLAGS[before:]]
+        del paper2md.FLAGS[before:]
+        self.assertIn("equation-diagram-split-delimiter", kinds)
+
+    def test_bracket_display_math_diagram_is_also_split(self):
+        # \[...\] is TeX's other display-math spelling and never passes
+        # through do_math()'s environment-based rep() at all -- only
+        # _stash_math()'s generic delimiter walk ever sees it.
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""), {}, {}, _Args())
+        src = ("\\[\\begin{tikzpicture}\\node (0) at (0,0) {$X$};"
+               "\\end{tikzpicture}\\]")
+        before = len(paper2md.FLAGS)
+        out = conv.restore(conv._stash_math(src))
+        del paper2md.FLAGS[before:]
+        self.assertIn("```", out)
+        self.assertIn("X", out)
+        self.assertNotIn("\\begin{tikzpicture}", out)
+
+
+class QuotedFenceDetection(unittest.TestCase):
+    r"""A theorem/definition's blockquote wrapping prefixes EVERY line with
+    "> ", fence and display-math delimiters included. run_checks() used to
+    look only for a line starting with exactly "```" or "$$", so a diagram
+    or display equation embedded in a theorem was never recognised as
+    fenced/math and got scanned -- and flagged -- as loose prose."""
+
+    def check(self, md):
+        before = len(paper2md.FLAGS)
+        n = paper2md.run_checks(md)
+        del paper2md.FLAGS[before:]
+        return n
+
+    def test_quoted_fence_is_still_a_fence(self):
+        md = "> **Lemma 1.** See below.\n>\n> ```\nEQUATION 1\n\\node raw\n> ```\n"
+        self.assertEqual(self.check(md), 0)
+
+    def test_quoted_display_math_is_still_display_math(self):
+        md = "> **Lemma 1.**\n>\n> $$\n> \\widetilde{T} \\circ f\n> $$\n"
+        self.assertEqual(self.check(md), 0)
+
+    def test_unquoted_prose_is_still_checked(self):
+        self.assertEqual(self.check("stray \\widetilde{T} outside math"), 1)
+
+
+class ColorWrappers(unittest.TestCase):
+    r"""--drop-color already strips a bare \color{...} declaration, which is
+    invisible in the compiled PDF. \textcolor{c}{text} and \colorbox{c}{text}
+    are the same kind of invisible revision markup, but wrap CONTENT that
+    must survive -- dropping the whole command (as drop_cmd_arg would) loses
+    the text, not just the color."""
+
+    def test_textcolor_keeps_the_text_drops_the_wrapper(self):
+        self.assertEqual(
+            paper2md.unwrap_trailing_arg(r"a \textcolor{blue}{important} b", "textcolor", 2),
+            "a important b")
+
+    def test_colorbox_keeps_the_text(self):
+        self.assertEqual(
+            paper2md.unwrap_trailing_arg(r"\colorbox{PineGreen!20}{$M$}", "colorbox", 2),
+            "$M$")
+
+    def test_fcolorbox_three_args(self):
+        self.assertEqual(
+            paper2md.unwrap_trailing_arg(r"\fcolorbox{red}{white}{ok}", "fcolorbox", 3),
+            "ok")
+
+
+class BareFontDeclarations(unittest.TestCase):
+    r"""{\em text} is LaTeX's older way of writing emphasis: a bare
+    font-switching command as the first token of a group, rather than
+    \emph{text}. do_text() only wrapped the \emph{...}/\textbf{...} call
+    form, so {\em ...} survived as raw, visible LaTeX."""
+
+    def render(self, src):
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""), {}, {}, _Args())
+        return conv._wrap_bare_font_group(src, "em", "*")
+
+    def test_group_becomes_the_emphasized_span(self):
+        self.assertEqual(self.render("a {\\em fiducial} test"), "a *fiducial* test")
+
+    def test_does_not_misfire_on_emph(self):
+        # {\em ...} must not match INSIDE an unrelated \emph{...} call
+        src = "a \\emph{fiducial} test"
+        self.assertEqual(self.render(src), src)
+
+
+class ProofMacros(unittest.TestCase):
+    r"""amsthm still provides \proof/\endproof as bare pre-environment proof
+    macros alongside \begin{proof}/\end{proof}, and some papers use them
+    directly. Expanding them before the structural passes (the same
+    treatment as \beq/\eeq) lets the existing proof-environment handling in
+    do_text() pick them up."""
+
+    def test_builtin_macros_expand_to_the_environment(self):
+        out = paper2md.expand_env_macros(r"\proof a = b \endproof",
+                                          paper2md.BUILTIN_MACROS)
+        self.assertEqual(out, r"\begin{proof} a = b \end{proof}")
 
 
 if __name__ == "__main__":
