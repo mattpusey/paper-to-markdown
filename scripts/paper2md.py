@@ -528,6 +528,15 @@ class Preamble:
             if body is not None:
                 self.tikz_styles.setdefault(m.group(1), body.strip())
 
+        # \tikzstyle{name}=[...] -- the older pre-tikzset way of naming a
+        # style, still common (a name here can contain a space, e.g.
+        # "small box", "right label" -- exactly the multi-word style names a
+        # node then selects with \node[style={small box}]).
+        for m in re.finditer(r"\\tikzstyle\{([^}]*)\}\s*=\s*(?=\[)", s):
+            body, _ = balanced(s, m.end(), "[", "]")
+            if body is not None:
+                self.tikz_styles.setdefault(m.group(1), body.strip())
+
         # \newtheorem{env}{Display}
         for m in re.finditer(r"\\newtheorem\s*\*?\s*\{(\w+)\}(?:\[\w+\])?\s*\{([^}]*)\}", s):
             self.theorems[m.group(1)] = m.group(2)
@@ -904,7 +913,15 @@ def convert_tikz(src, styles, style_map, fig_id):
         stylelist = [x.strip() for x in (m.group(1) or "").split(",") if x.strip()]
         prim = None
         for st in stylelist:
-            base = st.split("=")[0].strip()
+            # TikZiT-generated diagrams (the norm in this literature) write
+            # the style name as \node[style=NAME], not bare \node[NAME] --
+            # the key here is the literal word "style", not the style's own
+            # name, so splitting on "=" and taking [0] found "style" every
+            # time and no node was ever recognised as styled.
+            if st.startswith("style="):
+                base = st[len("style="):].strip().strip("{}").strip()
+            else:
+                base = st.split("=")[0].strip()
             if base in styles or base in style_map:
                 prim = base; break
         lab = (label or "").strip()
@@ -995,6 +1012,14 @@ def convert_tikz(src, styles, style_map, fig_id):
                  f"{styles.get(n['style'], '?')}", "")
 
     name2label = {n["name"]: (n["label"] or n["name"]) for n in nodes}
+    def endpoint_label(ref):
+        # An edge endpoint is often "5.center" or "5.north east" -- an
+        # anchor ON node 5, not a node in its own right. Resolving only the
+        # bare id still finds 5's real label; without this every edge
+        # touching a coordinate anchor (the common case: TikZ wiring is
+        # mostly done through invisible "none"-style anchor nodes) printed
+        # the raw "5.center" instead of the label that node was given.
+        return name2label.get(ref.split(".", 1)[0].strip(), ref)
     lines = [f"{fig_id}", "Nodes:"]
     for key, group in by_style.items():
         labels = ", ".join(n["label"] or n["name"] for n in group)
@@ -1002,7 +1027,7 @@ def convert_tikz(src, styles, style_map, fig_id):
     lines.append("Edges:")
     for a, b, directed in edges:
         arrow = "->" if directed else "--"
-        lines.append(f"  {name2label.get(a, a)} {arrow} {name2label.get(b, b)}")
+        lines.append(f"  {endpoint_label(a)} {arrow} {endpoint_label(b)}")
     return "\n".join(lines), ok
 
 # --------------------------------------------------------------------------
@@ -1180,6 +1205,14 @@ class Converter:
         line, same as every real display-math delimiter -- would desync
         every display-math open/close after it for the rest of the document.
         """
+        # A scrap of math copied straight from the source often still has
+        # its original line breaks (e.g. "= \Pr(E,P) \in [0,1]\n." from a
+        # two-line \tikeq call). $...$ spanning a literal newline is fragile
+        # -- some Markdown renderers, and this tool's own escaping-regime
+        # scan, only look for the closing $ on the SAME line -- and there is
+        # no display-math reason to keep the break, so it collapses to a
+        # single space like any other run of whitespace would.
+        text = re.sub(r"\s+", " ", text).strip()
         if (len(text) - len(text.rstrip("\\"))) % 2 == 1:
             # Near-always just a "\ " control-space (forcing a gap before/after
             # the diagram) that lost its space to .strip() -- dropping the
@@ -1510,6 +1543,7 @@ class Converter:
         s = re.sub(r"\\(?:label|nocite|bibliographystyle|bibliography|maketitle|centering"
                    r"|setlength|setcounter|addtolength|counterwithin|renewcommand"
                    r"|vspace|hspace|bigskip|medskip|smallskip|noindent|onecolumn|twocolumn"
+                   r"|onecolumngrid|twocolumngrid|allowdisplaybreaks"
                    r"|appendix|FloatBarrier|center|par)\b\s*\*?\s*(\[[^\]]*\])?", "", s)
         s = re.sub(r"\\begin\{(document|strip|abstract|center|subfigure)\}", "", s)
         s = re.sub(r"\\end\{(document|strip|abstract|center|subfigure)\}", "", s)
@@ -1667,6 +1701,12 @@ def run_checks(md):
         stripped = re.sub(r"\$\$[^$]*\$\$", "", ln)   # display math on one line
         stripped = re.sub(r"\$[^$]*\$", "", stripped)
         stripped = re.sub(r"\[\^\d+\]:?", "", stripped)
+        # A markdown link's URL, e.g. [text](https://doi.org/10.1007/x_1),
+        # routinely carries a literal "_" (a normal, common DOI character);
+        # it sits inside the (...) target, never inside rendered text, so it
+        # can never trigger Markdown's emphasis parsing the way a bare "_"
+        # in prose would.
+        stripped = re.sub(r"\]\([^()\s]*\)", "]()", stripped)
         # A bare command is not always a control WORD: LaTeX's commonest accents
         # are control SYMBOLS (\"o, \'e, \~n, \=a, \.z), so a \\[A-Za-z]+ scan
         # walks straight past exactly the constructs that corrupt text silently.

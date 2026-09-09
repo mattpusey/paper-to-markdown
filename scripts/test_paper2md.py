@@ -63,6 +63,16 @@ class EscapingRegimeCheck(unittest.TestCase):
                      "```\nFIGURE 1 \\node raw\n```"]:
             self.assertEqual(self.check(good), 0, good)
 
+    def test_underscore_in_a_link_url_is_not_a_violation(self):
+        # A DOI routinely contains "_"; it sits inside the (...) target,
+        # never in rendered text, so it can't trigger emphasis parsing the
+        # way a bare "_" in prose would.
+        self.assertEqual(self.check(
+            "[65] K. Husimi, [paper](https://doi.org/10.11429/ppmsj1919.22.4_264)"), 0)
+
+    def test_underscore_in_link_text_is_still_a_violation(self):
+        self.assertEqual(self.check("see [my_var](https://example.com)"), 1)
+
 
 class Accents(unittest.TestCase):
     """\~{n} used to come out as "\\ {n}": do_text() replaced "~" with a
@@ -107,6 +117,76 @@ class Accents(unittest.TestCase):
         # the one thing left raw is the URL tilde, and it is flagged, not silent
         self.assertEqual(sorted(f["kind"] for f in flags), ["escaping-regime", "no-aux"])
         self.assertTrue(any(r"\~boyd" in f["snippet"] for f in flags))
+
+
+class TikzConversion(unittest.TestCase):
+    r"""convert_tikz() encodes a tikzpicture as a node/edge list. Two bugs
+    fixed together here made real (TikZiT-generated) diagrams come out
+    almost entirely unstyled and with garbled edges:
+
+    1. TikZiT writes \node[style=NAME], never bare \node[NAME] -- the style
+       lookup split "style=NAME" on '=' and kept [0] ("style" itself, never
+       a real style name), so no node was ever recognised as styled.
+    2. An edge endpoint is routinely a coordinate anchor on a node, e.g.
+       (5.center) or (5.north east), not the bare node id -- looking those
+       up verbatim in the name/label map always missed, so the edge list
+       showed the raw "5.center" instead of node 5's actual label.
+    """
+
+    def test_style_equals_name_is_recognised(self):
+        src = ("\\begin{tikzpicture}\n"
+               "\\node [style=point] (0) at (0,0) {$A$};\n"
+               "\\end{tikzpicture}")
+        blk, ok = paper2md.convert_tikz(src, {"point": "..."}, {"point": "state"}, "FIG")
+        self.assertIn("A   [state]", blk)
+        self.assertTrue(ok)
+
+    def test_multi_word_braced_style_name(self):
+        src = ("\\begin{tikzpicture}\n"
+               "\\node [style={small box}, minimum width={1.5 cm}] (0) at (0,0) {$T$};\n"
+               "\\end{tikzpicture}")
+        blk, _ = paper2md.convert_tikz(src, {"small box": "..."},
+                                        {"small box": "process"}, "FIG")
+        self.assertIn("T   [process]", blk)
+
+    def test_edge_to_a_center_anchor_resolves_the_nodes_own_label(self):
+        src = ("\\begin{tikzpicture}\n"
+               "\\node [style=point] (0) at (0,0) {$A$};\n"
+               "\\node [style=none] (1) at (1,0) {};\n"
+               "\\draw (0) to (1.center);\n"
+               "\\end{tikzpicture}")
+        blk, _ = paper2md.convert_tikz(src, {"point": "..."}, {"point": "state"}, "FIG")
+        self.assertIn("A -- 1", blk)
+        self.assertNotIn(".center", blk)
+
+    def test_bare_style_name_without_style_equals_still_works(self):
+        # not TikZiT's convention, but \node[NAME] (no "style=") is valid
+        # TikZ and used to be the only form this recognised -- must keep
+        # working.
+        src = ("\\begin{tikzpicture}\n"
+               "\\node [point] (0) at (0,0) {$A$};\n"
+               "\\end{tikzpicture}")
+        blk, _ = paper2md.convert_tikz(src, {"point": "..."}, {"point": "state"}, "FIG")
+        self.assertIn("A   [state]", blk)
+
+
+class TikzStyleHarvesting(unittest.TestCase):
+    r"""Preamble only harvested \tikzset{name/.style={...}}, missing the
+    older (and, for TikZiT-generated diagrams, near-universal)
+    \tikzstyle{name}=[...] form entirely -- every node in a paper using it
+    fell back to [unstyled], with no flag ever raised to say so."""
+
+    def test_tikzstyle_form_is_harvested(self):
+        pre = paper2md.Preamble(r"\tikzstyle{point}=[regular polygon,draw]")
+        self.assertIn("point", pre.tikz_styles)
+
+    def test_multi_word_name_with_space(self):
+        pre = paper2md.Preamble(r"\tikzstyle{small box}=[rectangle,draw]")
+        self.assertIn("small box", pre.tikz_styles)
+
+    def test_tikzset_form_still_works(self):
+        pre = paper2md.Preamble(r"\tikzset{sv/.style={fill=blue}}")
+        self.assertIn("sv", pre.tikz_styles)
 
 
 class Nesting(unittest.TestCase):
@@ -375,6 +455,22 @@ class DiagramEquations(unittest.TestCase):
             "\\exists h \\in\\mathcal{P} : \\ \n"
             "\\begin{tikzpicture}\\node (0) at (0,0) {};\\end{tikzpicture}", None)
         self.assertNotIn("$$", out)
+
+    def test_internal_newline_in_the_surrounding_math_is_collapsed(self):
+        # "= \Pr(E,P) \in [0,1]\n." -- two physical lines of one inline math
+        # scrap, straight from the source. $...$ spanning a literal newline
+        # is fragile (some renderers, and this tool's own escaping-regime
+        # scan, only look for the closing $ on the same line as the opening
+        # one), and there is no reason to keep a display-math-style break in
+        # what renders as ordinary inline math.
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""), {}, {}, _Args())
+        conv._render_diagram_equation(
+            "\\begin{tikzpicture}\\node (0) at (0,0) {};\\end{tikzpicture}\n"
+            "= \\Pr(E,P) \\in [0,1]\n.", "22")
+        stashed = " ".join(v for v in conv.store.values() if isinstance(v, str))
+        self.assertIn("= \\Pr(E,P) \\in [0,1] .", stashed)
 
     def test_unbalanced_left_right_across_the_fence_is_flagged(self):
         class _Args:
