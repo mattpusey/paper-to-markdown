@@ -433,6 +433,204 @@ def resolve_includes(text, base_dir, seen=None):
     return text
 
 # --------------------------------------------------------------------------
+# frontmatter harvesting (\title / \author / \affiliation)
+# --------------------------------------------------------------------------
+#
+# REVTeX (revtex4-1/4-2 -- i.e. most of physics) puts the frontmatter AFTER
+# \begin{document} rather than in the preamble:
+#
+#     \begin{document}
+#     \title{A title\\ over two lines}
+#     \author{A. One}\email{one@x.edu}\affiliation{Institute One}
+#     \author{B. Two}\affiliation{Institute Two}
+#     \date{12 March 2020}
+#     \begin{abstract} ... \end{abstract}
+#     \maketitle
+#
+# Looking for it in the preamble alone therefore found no \title at all on
+# exactly these papers -- a `no-title' flag, no heading and no author list --
+# and left the whole block sitting in the body, where no other pass claims
+# those commands, so every one of them leaked into the markdown as raw
+# LaTeX. One scanner now runs over both regions and whatever it claims in
+# the body is deleted from the body (see adopt_body_frontmatter).
+#
+# Affiliations bind POSITIONALLY in REVTeX: an \affiliation applies to the
+# run of \author commands immediately preceding it, and one such group can
+# carry several. authblk's \author[1]{...}/\affil[1]{...} instead carries
+# explicit keys, so those are kept as given wherever they appear.
+
+FRONTMATTER_CMDS = ("title", "author", "collaboration", "affiliation", "affil",
+                    "altaffiliation", "email", "homepage", "thanks", "date",
+                    "pacs", "keywords", "preprint")
+
+_FM_RE = re.compile(r"\\(%s)(?![A-Za-z])\s*\*?\s*(?:\[([^\]]*)\])?\s*(?=\{)"
+                    % "|".join(FRONTMATTER_CMDS))
+
+# Commands that turn up INSIDE a frontmatter value and carry a footnote
+# rather than part of the name: \author{A. One\thanks{Now at ...}}.
+_FM_NESTED = ("thanks", "footnote", "footnotemark", "altaffilmark",
+              "email", "homepage")
+
+def tidy_frontmatter(val, sep=" "):
+    r"""Text-level cleanup for one \title/\author/\affiliation value.
+
+    A frontmatter value is emitted straight into the heading block, so it
+    never passes through do_text() -- whatever do_text() would have done to
+    it has to happen here or it leaks. Two things actually bite: a "~"
+    (REVTeX affiliations are full of them) would survive as a literal tilde,
+    and the "\\" of a two-line title as a bare backslash pair, which is an
+    escaping-regime violation in its own right.
+    """
+    for cmd in _FM_NESTED:
+        pruned = drop_cmd_arg(val, cmd, 1)
+        if pruned != val:
+            flag("frontmatter-dropped",
+                 f"\\{cmd} inside a frontmatter value is a footnote, not part "
+                 f"of the name; not carried into the heading block", val)
+            val = pruned
+    val = re.sub(r"\\(?:vspace|hspace)\s*\*?\s*\{[^}]*\}", "", val)
+    val = re.sub(r"\\\\\s*\*?\s*(?:\[[^\]]*\])?", sep, val)
+    val = re.sub(r"\\(?:newline|linebreak|par|noindent)(?![A-Za-z])", sep, val)
+    # A tilde is a non-breaking space -- unless it is the accent \~{n}, whose
+    # tilde decode_accents() still needs (it runs later, at emission).
+    val = re.sub(r"(?<!\\)~", " ", val)
+    val = re.sub(r"\s+", " ", val)
+    return val.strip(" " + sep.strip())
+
+
+class Frontmatter:
+    r"""The title block harvested out of one region of the source.
+
+    self.text is that region with every command the harvest CLAIMED removed
+    and nothing else touched, so a caller working on the body can put back
+    what is left -- the abstract, mostly -- without the raw commands.
+    """
+
+    def __init__(self, region):
+        self.title = None
+        self.authors = []          # (affiliation key, name)
+        self.affils = []           # (key, affiliation)
+        self.emails = []           # (author name, address)
+        self.date = None
+        self.text = self._parse(region)
+
+    def _parse(self, s):
+        kept, i = [], 0
+        authors, affils = [], OrderedDict()
+        group, explicit, after_affil = [], False, False
+        named = None                       # last real \author, for \email
+        for m in _FM_RE.finditer(s):
+            if m.start() < i:              # inside an argument already taken
+                continue
+            arg, after = balanced(s, m.end())
+            if arg is None:
+                continue
+            cmd, key = m.group(1), m.group(2)
+            kept.append(s[i:m.start()])
+            i = after
+            if cmd in ("author", "collaboration"):
+                # \and separates authors WITHIN one \author{...} (article
+                # class); REVTeX repeats \author instead. Both occur.
+                names = [n for n in (tidy_frontmatter(part) for part in
+                                     re.split(r"\\and(?![A-Za-z])", arg)) if n]
+                if not names:
+                    continue
+                if after_affil:            # a new group starts after one
+                    group, after_affil = [], False
+                explicit = explicit or bool(key)
+                for name in names:
+                    a = {"key": key or "", "name": name, "affils": []}
+                    authors.append(a)
+                    group.append(a)
+                if cmd == "author":
+                    named = names[-1]
+                continue
+            val = tidy_frontmatter(arg, ", " if "affil" in cmd else " ")
+            if not val:
+                continue
+            if cmd == "title":
+                if self.title is None:
+                    self.title = val
+            elif cmd in ("affiliation", "affil", "altaffiliation"):
+                explicit = explicit or bool(key)
+                k = affils.setdefault(val, key or str(len(affils) + 1))
+                for a in group:
+                    if k not in a["affils"]:
+                        a["affils"].append(k)
+                after_affil = True
+            elif cmd in ("email", "homepage"):
+                # An \email belongs to the \author it follows -- and only to
+                # an \author: a \collaboration is a group name, not a person.
+                self.emails.append((named or "", val))
+            elif cmd == "date":
+                # \date{\today} says nothing at conversion time; a literal
+                # date is what the PDF prints.
+                if "\\" not in val:
+                    self.date = val
+            else:                          # pacs / keywords / thanks / preprint
+                flag("frontmatter-dropped",
+                     f"\\{cmd}{{{val}}} has no heading-block equivalent and is "
+                     f"not emitted; restore it by hand if the PDF prints it",
+                     m.group(0))
+        kept.append(s[i:])
+        # One affiliation shared by everybody needs no superscripts at all,
+        # and neither does one that attached to nobody (it preceded every
+        # \author): a superscript no author carries is noise.
+        used = {k for a in authors for k in a["affils"]}
+        bare = not used or (len(affils) == 1 and not explicit)
+        for a in authors:
+            self.authors.append(
+                (a["key"] or ("" if bare else ",".join(a["affils"])), a["name"]))
+        for val, k in affils.items():
+            self.affils.append(("" if bare else k, val))
+        return "".join(kept)
+
+
+_BODY_FM_RE = re.compile(r"\\(?:title|author|collaboration|affiliation|affil)"
+                         r"(?![A-Za-z])\s*\*?\s*(?:\[[^\]]*\])?\s*\{")
+
+def adopt_body_frontmatter(pre, body):
+    r"""Move a post-\begin{document} frontmatter block into `pre`.
+
+    The block runs to \maketitle -- or, on a paper that has none, to
+    whatever comes first of the abstract, the bibliography and the first
+    sectioning command. The abstract sits inside that span on REVTeX
+    papers and is deliberately left exactly where it is: only the
+    frontmatter commands themselves are removed, so the returned body still
+    carries every word of prose it did before.
+    """
+    m = re.search(r"\\maketitle(?![A-Za-z])", body)
+    if m:
+        end = m.end()
+    else:
+        m = re.search(r"\\(?:section|chapter|part)(?![A-Za-z])"
+                      r"|\\begin\{(?:thebibliography|abstract)\}", body)
+        end = m.start() if m else len(body)
+    region, rest = body[:end], body[end:]
+    if not _BODY_FM_RE.search(region):
+        return body
+    fm = Frontmatter(region)
+    if pre.title is None:
+        pre.title = fm.title
+    elif fm.title and fm.title != pre.title:
+        flag("frontmatter-duplicate",
+             f"\\title is given both in the preamble and after "
+             f"\\begin{{document}}; kept the preamble's ({pre.title})", fm.title)
+    if not pre.authors:
+        pre.authors = fm.authors
+        pre.affils = fm.affils or pre.affils
+    elif fm.authors:
+        flag("frontmatter-duplicate",
+             "\\author is given both in the preamble and after "
+             "\\begin{document}; kept the preamble's",
+             ", ".join(n for _, n in fm.authors))
+    if not pre.emails:
+        pre.emails = fm.emails
+    if pre.date is None:
+        pre.date = fm.date
+    return fm.text + rest
+
+# --------------------------------------------------------------------------
 # preamble harvesting
 # --------------------------------------------------------------------------
 
@@ -461,6 +659,8 @@ class Preamble:
         self.title = None
         self.authors = []
         self.affils = []
+        self.emails = []
+        self.date = None
         self._harvest()
 
     def _harvest(self):
@@ -541,18 +741,12 @@ class Preamble:
         for m in re.finditer(r"\\newtheorem\s*\*?\s*\{(\w+)\}(?:\[\w+\])?\s*\{([^}]*)\}", s):
             self.theorems[m.group(1)] = m.group(2)
 
-        # title block
-        m = re.search(r"\\title\s*(\{)", s)
-        if m:
-            t, _ = balanced(s, m.end() - 1)
-            if t:
-                self.title = re.sub(r"\\vspace\s*\{[^}]*\}", "", t).strip()
-        for m in re.finditer(r"\\author\s*(?:\[([^\]]*)\])?\s*(\{)", s):
-            a, _ = balanced(s, m.end() - 1)
-            if a: self.authors.append((m.group(1) or "", a.strip()))
-        for m in re.finditer(r"\\affil\s*(?:\[([^\]]*)\])?\s*(\{)", s):
-            a, _ = balanced(s, m.end() - 1)
-            if a: self.affils.append((m.group(1) or "", a.strip()))
+        # title block -- the same scanner main() runs over the body, since a
+        # REVTeX paper carries the whole block after \begin{document}
+        fm = Frontmatter(s)
+        self.title = fm.title
+        self.authors, self.affils = fm.authors, fm.affils
+        self.emails, self.date = fm.emails, fm.date
 
 # --------------------------------------------------------------------------
 # macro expansion
@@ -1898,6 +2092,9 @@ def run_checks(md):
         # can never trigger Markdown's emphasis parsing the way a bare "_"
         # in prose would.
         stripped = re.sub(r"\]\([^()\s]*\)", "]()", stripped)
+        # An autolinked address, e.g. the <first_last@example.edu> of an
+        # \email in the frontmatter, is a target too and never rendered text.
+        stripped = re.sub(r"<[^<>\s]+>", "", stripped)
         # A bare command is not always a control WORD: LaTeX's commonest accents
         # are control SYMBOLS (\"o, \'e, \~n, \=a, \.z), so a \\[A-Za-z]+ scan
         # walks straight past exactly the constructs that corrupt text silently.
@@ -1947,6 +2144,7 @@ def main():
     else:
         pre_txt, body = "", src
     pre = Preamble(pre_txt)
+    body = adopt_body_frontmatter(pre, body)
 
     # auto-locate aux/bbl next to the source
     stem = os.path.splitext(a.tex)[0]
@@ -2015,16 +2213,33 @@ def main():
 
     # front matter
     head = []
-    # The title block never passes through do_text(), so decode its accents here.
+    # The title block never passes through do_text(), so everything do_text()
+    # would have done to it happens here instead: macros expanded (an
+    # institute or acronym macro inside \title/\affiliation is routine),
+    # font commands turned into markdown, accents decoded.
+    def frontmatter_text(v):
+        v = expand_macros(v, text_macros)
+        for cmd, wrap in [("emph", "*"), ("textit", "*"), ("textbf", "**"),
+                          ("texttt", "`"), ("textsc", ""), ("textrm", ""),
+                          ("mbox", "")]:
+            v = conv._wrap(v, cmd, wrap)
+        return decode_accents(v)
     if pre.title:
-        head.append("# " + decode_accents(pre.title))
+        head.append("# " + frontmatter_text(pre.title))
     else:
-        flag("no-title", "No \\title found in the preamble.")
+        flag("no-title", "No \\title found in the preamble or before \\maketitle.")
     if pre.authors:
-        head.append(", ".join(f"**{decode_accents(n)}**" + (f"<sup>{k}</sup>" if k else "")
+        head.append(", ".join(f"**{frontmatter_text(n)}**"
+                              + (f"<sup>{k}</sup>" if k else "")
                               for k, n in pre.authors))
     for k, v in pre.affils:
-        head.append(f"<sup>{k}</sup> {decode_accents(v)}")
+        head.append((f"<sup>{k}</sup> " if k else "") + frontmatter_text(v))
+    if pre.emails:
+        head.append("Contact: " + ", ".join(
+            (f"{frontmatter_text(who)} " if who else "") + f"<{addr}>"
+            for who, addr in pre.emails))
+    if pre.date:
+        head.append("*" + frontmatter_text(pre.date) + "*")
     md = "\n\n".join(head) + "\n\n" + body.strip() + "\n"
 
     if conv.footnotes and not getattr(conv, "footnotes_spliced", False):
