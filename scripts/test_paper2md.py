@@ -189,6 +189,79 @@ class TikzStyleHarvesting(unittest.TestCase):
         self.assertIn("sv", pre.tikz_styles)
 
 
+class MultirowAlign(unittest.TestCase):
+    r"""align/gather/eqnarray number EVERY \\-separated row by default in
+    real LaTeX -- \nonumber/\notag opts a row OUT, it's not opt-in. Treating
+    the whole block as a single $$...$$\tag{} (as equation/multline
+    correctly do) silently drops every row's number but the first, so every
+    later unlabelled equation in the document derives from the wrong
+    baseline. A single five-row, fully-unlabelled align in the source paper
+    this was found on undercounted every subsequent derived number by 4 for
+    the rest of the document.
+    """
+
+    def convert(self, tex, aux_labels=None):
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""), aux_labels or {}, {}, _Args())
+        before = len(paper2md.FLAGS)
+        out = conv.restore(conv.do_math(tex))
+        flags = paper2md.FLAGS[before:]
+        del paper2md.FLAGS[before:]
+        return out, flags, conv
+
+    def test_each_unlabelled_row_gets_its_own_derived_number(self):
+        tex = ("\\begin{equation}\\label{a} x = 1 \\end{equation}\n"
+               "\\begin{align}\n"
+               "y &= 2 \\\\\n"
+               "z &= 3 \\\\\n"
+               "w &= 4\n"
+               "\\end{align}")
+        out, flags, conv = self.convert(tex, {"a": "5"})
+        self.assertEqual(re.findall(r"\\tag\{([^}]*)\}", out), ["5", "6", "7", "8"])
+        self.assertEqual(conv.eq_last, "8")
+        kinds = [f["kind"] for f in flags]
+        self.assertEqual(kinds.count("equation-derived-number"), 3)
+
+    def test_nonumber_row_is_skipped(self):
+        tex = ("\\begin{equation}\\label{a} x = 1 \\end{equation}\n"
+               "\\begin{align}\n"
+               "y &= 2 \\nonumber \\\\\n"
+               "z &= 3\n"
+               "\\end{align}")
+        out, flags, conv = self.convert(tex, {"a": "5"})
+        self.assertEqual(re.findall(r"\\tag\{([^}]*)\}", out), ["5", "6"])
+        self.assertNotIn("\\nonumber", out)
+
+    def test_labelled_row_uses_the_real_number(self):
+        tex = ("\\begin{equation}\\label{a} x = 1 \\end{equation}\n"
+               "\\begin{align}\n"
+               "y &= 2 \\\\\n"
+               "z &= 3 \\label{b}\n"
+               "\\end{align}")
+        out, flags, conv = self.convert(tex, {"a": "5", "b": "40"})
+        self.assertEqual(re.findall(r"\\tag\{([^}]*)\}", out), ["5", "6", "40"])
+        self.assertEqual(conv.eq_last, "40")
+
+    def test_diagram_row_still_gets_one_number_not_per_row(self):
+        # A tikzpicture inside align/gather/eqnarray keeps the figure-like
+        # single-number treatment; per-row numbering only applies when
+        # there's no diagram to render instead.
+        tex = ("\\begin{equation}\\label{a} x = 1 \\end{equation}\n"
+               "\\begin{align}\n"
+               "\\begin{tikzpicture}\\node (0) at (0,0) {};\\end{tikzpicture}\n"
+               "\\end{align}")
+        out, flags, conv = self.convert(tex, {"a": "5"})
+        self.assertIn("**Equation 6:**", out)
+        self.assertEqual(conv.eq_last, "6")
+
+    def test_starred_align_rows_stay_unnumbered(self):
+        tex = "\\begin{align*}\ny &= 2 \\\\\nz &= 3\n\\end{align*}"
+        out, flags, conv = self.convert(tex)
+        self.assertNotIn("\\tag", out)
+        self.assertIsNone(conv.eq_last)
+
+
 class Nesting(unittest.TestCase):
     """Every \\begin{X}(.*?)\\end{X} regex stopped at the FIRST inner
     \\end{X}, so a tabular inside a cell truncated the outer table and the

@@ -1282,13 +1282,31 @@ class Converter:
                 env = node.environmentname
                 starred = env.endswith("*")
                 env = env[:-1] if starred else env
+                if starred:
+                    inner = re.sub(r"\\nonumber|\\notag", "", inner)
+                    diagram = self._render_diagram_equation(inner, None)
+                    if diagram is not None:
+                        return diagram
+                    if env in ("multline", "gather", "eqnarray", "align"):
+                        inner = "\\begin{aligned}%s\\end{aligned}" % inner
+                    return self.stash("$$\n%s\n$$" % inner.strip())
+
+                # align/gather/eqnarray number EVERY ROW by default in real
+                # LaTeX (unlike equation/multline, which are one number
+                # regardless of how many \\-separated lines they contain) --
+                # unless a row carries \nonumber/\notag. A tikzpicture inside
+                # one of these still gets the figure-like single-number
+                # treatment (matching how a figure is captioned once, not
+                # per sub-panel); per-row numbering only applies when there
+                # is no diagram to render instead.
+                if (env in ("align", "gather", "eqnarray")
+                        and not env_spans(inner, {"tikzpicture"})):
+                    return self._render_multirow_align(inner, anc, env)
+
                 labs = re.findall(r"\\label\s*\{([^}]*)\}", inner)
                 tag = ""
                 eq_num = None
-                if starred:
-                    # \begin{equation*} etc. are unnumbered in LaTeX too
-                    pass
-                elif labs:
+                if labs:
                     num = self.labels.get(labs[0])
                     if num:
                         tag = "\n\\tag{%s}" % num
@@ -1325,7 +1343,7 @@ class Converter:
                              f"unlabelled {env} and no previous number to continue from — "
                              f"equation emitted without a number", inner)
                 inner = re.sub(r"\\label\s*\{[^}]*\}", "", inner)
-                inner = re.sub(r"\\nonumber", "", inner)
+                inner = re.sub(r"\\nonumber|\\notag", "", inner)
                 diagram = self._render_diagram_equation(inner, eq_num)
                 if diagram is not None:
                     return diagram
@@ -1335,6 +1353,82 @@ class Converter:
             s = replace_envs(s, names, rep)
         s = re.sub(r"\\(?:begin|end)\{subequations\}", "", s)
         return self._stash_math(s)
+
+    @staticmethod
+    def _split_display_rows(inner):
+        """Split a display-math body on top-level "\\\\" row separators
+        (LaTeX's own row break), skipping over one inside a brace group so
+        a nested \\begin{matrix}...\\\\...\\end{matrix} doesn't fragment.
+        """
+        rows, depth, cur, i, n = [], 0, [], 0, len(inner)
+        while i < n:
+            c = inner[i]
+            if c == "\\" and inner[i:i + 2] == "\\\\" and depth == 0:
+                rows.append("".join(cur))
+                cur = []
+                i += 2
+                continue
+            if c == "{":
+                depth += 1
+            elif c == "}":
+                depth = max(0, depth - 1)
+            cur.append(c)
+            i += 1
+        rows.append("".join(cur))
+        return rows
+
+    def _render_multirow_align(self, inner, anc, env):
+        """align/gather/eqnarray number every \\\\-separated row by default
+        in real LaTeX -- \\nonumber/\\notag is what OPTS a row out, not the
+        other way around. Treating the whole block as one $$...$$\\tag{} (as
+        the plain equation/multline path does) silently drops every number
+        but the first row's, and every later unlabelled equation in the
+        document then derives from the wrong baseline -- a four-number
+        undercount from one five-row align is enough to misnumber every
+        unlabelled equation for the rest of the paper.
+        """
+        rows = self._split_display_rows(inner)
+        in_sub = "subequations" in anc
+        out_rows = []
+        for row in rows:
+            labs = re.findall(r"\\label\s*\{([^}]*)\}", row)
+            nonum = bool(re.search(r"\\nonumber\b|\\notag\b", row))
+            tag = ""
+            if labs:
+                num = self.labels.get(labs[0])
+                if num:
+                    tag = " \\tag{%s}" % num
+                    self.eq_last = num
+                else:
+                    flag("equation-unnumbered",
+                         f"no .aux entry for equation label '{labs[0]}' — "
+                         f"row emitted without a number", row)
+                if len(labs) > 1:
+                    flag("equation-multi-label",
+                         f"one row of an {env} carries multiple labels "
+                         f"({', '.join(labs)}); only the first is used. Split "
+                         f"the row by hand if the extra labels are referenced.",
+                         row)
+            elif not nonum:
+                prev = self.eq_last
+                derived = next_eq_number(prev, in_sub)
+                if derived:
+                    tag = " \\tag{%s}" % derived
+                    self.eq_last = derived
+                    flag("equation-derived-number",
+                         f"unlabelled {env} row numbered {derived}, continuing "
+                         f"from {prev}. It has no \\label, so this is derived "
+                         f"rather than read from the .aux — check it against "
+                         f"the PDF.", row)
+                else:
+                    flag("equation-unnumbered",
+                         f"unlabelled {env} row and no previous number to "
+                         f"continue from — row emitted without a number", row)
+            row = re.sub(r"\\label\s*\{[^}]*\}", "", row)
+            row = re.sub(r"\\nonumber\b|\\notag\b", "", row)
+            out_rows.append(row.rstrip() + tag)
+        inner_out = "\\\\\n".join(out_rows)
+        return self.stash("$$\n\\begin{aligned}%s\\end{aligned}\n$$" % inner_out)
 
     def _stash_math(self, s):
         r"""$...$, $$...$$, \[...\] and \(...\) -> placeholders, in ONE walk.
