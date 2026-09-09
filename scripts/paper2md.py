@@ -902,6 +902,7 @@ NODE_RE = re.compile(r"\\node\s*(?:\[([^\]]*)\])?\s*\(([^)]*)\)\s*(?:at\s*\(([^)
 EDGE_RE = re.compile(
     r"\\(?:draw|path)\s*(?:\[([^\]]*)\])?\s*\(([^)]*)\)\s*"
     r"(--|to)\s*(?:\[[^\]]*\])?\s*\(([^)]*)\)\s*;")
+FILLDRAW_RE = re.compile(r"\\filldraw\s*(?=\[)")
 SAFE_CMDS = {"node", "draw", "path", "coordinate", "begin", "end", "tikzset", "centering"}
 
 def convert_tikz(src, styles, style_map, fig_id):
@@ -934,6 +935,34 @@ def convert_tikz(src, styles, style_map, fig_id):
             continue  # computed coordinate, not a real endpoint
         directed = "->" in (m.group(1) or "")
         edges.append((a, b, directed))
+
+    # \filldraw[fill=COLOR,draw=...] (n1.center) to (n2.center) to ... to
+    # cycle; draws a filled polygon over a group of node anchors -- in this
+    # literature it is always a shaded highlight/background behind part of
+    # the diagram (a "this sub-box is being called out" visual), never a
+    # node in its own right. Every instance in this paper follows exactly
+    # this shape, so it is worth recognising structurally rather than
+    # leaving it as a per-figure "check by hand" flag: extract the fill
+    # colour and the anchors it spans so the shading survives as a line of
+    # text instead of disappearing (or being misread as an unparsed
+    # command).
+    shades = []
+    for m in FILLDRAW_RE.finditer(src):
+        opts, after_opts = balanced(src, m.end(), "[", "]")
+        if opts is None:
+            continue
+        semi = src.find(";", after_opts)
+        if semi == -1:
+            continue
+        path = src[after_opts:semi]
+        refs = [r.strip() for r in re.findall(r"\(([^)]*)\)", path)]
+        refs = [r for r in refs if r]
+        if not refs:
+            continue
+        fill_m = re.search(r"fill\s*=\s*([^,\]]+)", opts)
+        fill = fill_m.group(1).strip() if fill_m else "shaded"
+        shades.append((fill, refs))
+        consumed.append((m.start(), semi + 1))
 
     # anything we did not consume that looks structural? Blank out the FULL
     # matched span for each \node/\draw -- for a \node this must include the
@@ -1028,6 +1057,11 @@ def convert_tikz(src, styles, style_map, fig_id):
     for a, b, directed in edges:
         arrow = "->" if directed else "--"
         lines.append(f"  {endpoint_label(a)} {arrow} {endpoint_label(b)}")
+    if shades:
+        lines.append("Shaded regions:")
+        for fill, refs in shades:
+            labels = ", ".join(dict.fromkeys(endpoint_label(r) for r in refs))
+            lines.append(f"  [{fill}] spans {labels}")
     return "\n".join(lines), ok
 
 # --------------------------------------------------------------------------
@@ -1194,15 +1228,20 @@ class Converter:
         delimiter. This is not a rare edge case here: a "\\ " control-space
         right before \\begin{tikzpicture} (forcing a gap before the diagram)
         survives .strip() as a bare trailing backslash once its space is
-        gone. An escaped $ isn't a delimiter, so the real closing $ becomes
-        whatever unescaped $ comes along next in the DOCUMENT -- silently
-        swallowing every paragraph in between (refs, citations, prose) into
-        one bogus math span that never reaches do_text().
+        gone -- and it does not matter whether an even or odd number of
+        backslashes precede the $: "\\\\$" reads as "\\" (a real command,
+        e.g. a line break) immediately followed by an escaped dollar just as
+        readily as a lone "\\$" does, since the escape is a property of the
+        LAST backslash touching the $, not of how many came before it. An
+        escaped $ isn't a delimiter, so the real closing $ becomes whatever
+        unescaped $ comes along next in the DOCUMENT -- silently swallowing
+        every paragraph in between (refs, citations, prose) into one bogus
+        math span that never reaches do_text().
 
-        Returns None if there is nothing left to show (a bare "\ " with no
-        other content trims down to the empty string) -- the caller must
-        drop it rather than emit "$$", which -- sitting alone on its own
-        line, same as every real display-math delimiter -- would desync
+        Returns None if there is nothing left to show (trailing backslashes
+        with no other content trim down to the empty string) -- the caller
+        must drop it rather than emit "$$", which -- sitting alone on its
+        own line, same as every real display-math delimiter -- would desync
         every display-math open/close after it for the rest of the document.
         """
         # A scrap of math copied straight from the source often still has
@@ -1213,13 +1252,16 @@ class Converter:
         # no display-math reason to keep the break, so it collapses to a
         # single space like any other run of whitespace would.
         text = re.sub(r"\s+", " ", text).strip()
-        if (len(text) - len(text.rstrip("\\"))) % 2 == 1:
-            # Near-always just a "\ " control-space (forcing a gap before/after
-            # the diagram) that lost its space to .strip() -- dropping the
-            # bare backslash costs nothing but the gap. Silent: flagging
-            # every occurrence would be noise on a paper with this many
-            # diagram equations, for a spacing artifact with no content risk.
-            text = text[:-1].rstrip()
+        # Peel trailing backslash-tokens one at a time: source text often
+        # has SEVERAL of them back to back with only whitespace between
+        # ("\ \" -- a control-space then a bare line-continuation "\"), and
+        # stripping just once leaves the next one exposed as the new
+        # trailing backslash. Loop until a pass changes nothing.
+        while True:
+            trimmed = text.rstrip().rstrip("\\")
+            if trimmed == text:
+                break
+            text = trimmed
         if not text:
             return None
         if text.count("\\left") != text.count("\\right"):

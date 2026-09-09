@@ -170,6 +170,42 @@ class TikzConversion(unittest.TestCase):
         self.assertIn("A   [state]", blk)
 
 
+class TikzFilldrawShading(unittest.TestCase):
+    r"""\filldraw[fill=COLOR,...] (n.center) to (m.center) to ... to cycle;
+    draws a shaded highlight polygon over a group of node anchors. Every
+    occurrence in the wild (112 in one paper alone) followed this exact
+    shape and none carried any other content, but the extractor did not
+    recognise \filldraw at all, so each one leaked into the "unhandled TikZ
+    commands" residue check and got a generic "check the figure by hand"
+    flag instead of the shading surviving as text."""
+
+    def test_filldraw_becomes_a_shaded_region_line(self):
+        src = ("\\begin{tikzpicture}\n"
+               "\\node [style=none] (0) at (0,0) {$A$};\n"
+               "\\node [style=none] (1) at (1,0) {$B$};\n"
+               "\\filldraw[fill=green!20,draw=green!40] (0.center) to "
+               "(1.center) to cycle;\n"
+               "\\end{tikzpicture}")
+        blk, ok = paper2md.convert_tikz(src, {}, {}, "FIG")
+        self.assertTrue(ok)
+        self.assertIn("Shaded regions:", blk)
+        self.assertIn("green!20", blk)
+        self.assertIn("A, B", blk)
+
+    def test_filldraw_no_longer_flagged_as_unparsed(self):
+        src = ("\\begin{tikzpicture}\n"
+               "\\node [style=none] (0) at (0,0) {$A$};\n"
+               "\\node [style=none] (1) at (1,0) {$B$};\n"
+               "\\filldraw[fill=white,draw=black] (0.center) to "
+               "(1.center) to cycle;\n"
+               "\\end{tikzpicture}")
+        before = len(paper2md.FLAGS)
+        blk, ok = paper2md.convert_tikz(src, {}, {}, "FIG")
+        self.assertTrue(ok)
+        new_flags = paper2md.FLAGS[before:]
+        self.assertFalse(any(f["kind"] == "tikz-unparsed-commands" for f in new_flags))
+
+
 class TikzStyleHarvesting(unittest.TestCase):
     r"""Preamble only harvested \tikzset{name/.style={...}}, missing the
     older (and, for TikZiT-generated diagrams, near-universal)
@@ -406,6 +442,43 @@ class LeftoverCommandStripping(unittest.TestCase):
     def test_command_itself_still_removed(self):
         out = self.strip("a \\noindent b")
         self.assertNotIn("\\noindent", out)
+
+
+class InlineMathTrailingBackslash(unittest.TestCase):
+    r"""_inline_math_segment() must drop ANY run of trailing backslashes,
+    not just an odd count: a real "\\" line-break command sitting right
+    before the closing $ is just as much an escaped-dollar hazard as a
+    lone "\\" is, since the escape depends only on the last backslash
+    touching the $, not on how many precede it."""
+
+    def seg(self, s):
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""), {}, {}, _Args())
+        key = conv._inline_math_segment(s, "eq:x")
+        return conv.store[key] if key is not None else None
+
+    def test_odd_trailing_backslash_is_stripped(self):
+        out = self.seg(r"x = 1 \ ")
+        self.assertFalse(out.rstrip("$").endswith("\\"))
+
+    def test_even_trailing_backslash_is_also_stripped(self):
+        out = self.seg("x = 1 \\\\")
+        self.assertFalse(out.rstrip("$").endswith("\\"))
+
+    def test_content_before_backslashes_is_kept(self):
+        out = self.seg("x = 1 \\\\")
+        self.assertIn("x = 1", out)
+
+    def test_only_backslashes_yields_none(self):
+        self.assertIsNone(self.seg(" \\\\ "))
+
+    def test_multiple_separated_trailing_backslash_tokens_all_peeled(self):
+        # "\forall \tau  \ \" -- a "\ " control-space followed by a bare
+        # line-continuation "\" -- must not leave the second one behind
+        # after only the first is stripped.
+        out = self.seg("\\forall \\tau  \\ \\")
+        self.assertEqual(out, "$\\forall \\tau$")
 
 
 class TableFloats(unittest.TestCase):
