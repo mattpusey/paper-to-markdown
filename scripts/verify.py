@@ -118,7 +118,14 @@ def check_equations(md):
     a spurious wall of gaps for numbers that are not missing at all, just
     not spelled \\tag{}.
     """
-    tags = re.findall(r"\\tag\{([^}]*)\}", md) + EQ_CAP_RE.findall(md)
+    # Merged in DOCUMENT ORDER by position, not "all \tag{}s then all
+    # **Equation N:** headers" -- concatenating the two findall() lists
+    # outright interleaves two independently-ordered sequences into one and
+    # reports the seam between them as a bogus ascending-order failure,
+    # even when each is individually in order.
+    matches = ([(m.start(), m.group(1)) for m in re.finditer(r"\\tag\{([^}]*)\}", md)]
+               + [(m.start(), m.group(1)) for m in EQ_CAP_RE.finditer(md)])
+    tags = [t for _, t in sorted(matches)]
     numeric, other, dupes, seen = [], [], [], set()
     for t in tags:
         t = t.strip()

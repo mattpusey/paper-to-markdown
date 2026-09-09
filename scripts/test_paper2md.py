@@ -272,6 +272,25 @@ class MultirowAlign(unittest.TestCase):
         # the diagram row's dropped "&" doesn't survive into the fenced block
         self.assertNotIn("&", out.split("**Equation 6:**")[1].split("```")[1])
 
+    def test_label_on_top_nonumber_row_moves_to_the_actually_numbered_row(self):
+        # \begin{align}\label{X} with \nonumber on every row until the last
+        # is a real pattern (found in the source paper this was built
+        # against): \label right after \begin{align} sits, textually, in
+        # the first row -- but that row is \nonumber, so LaTeX never gives
+        # it a number, and \label{X} could not sensibly refer to it. The
+        # label has to land on the row that actually gets numbered.
+        tex = ("\\begin{equation}\\label{a} x = 1 \\end{equation}\n"
+               "\\begin{align} \\label{tomloc}\n"
+               "y = 2 \\nonumber \\\\\n"
+               "z = 3 \\nonumber \\\\\n"
+               "w = 4\n"
+               "\\end{align}")
+        out, flags, conv = self.convert(tex, {"a": "5", "tomloc": "6"})
+        self.assertEqual(re.findall(r"\\tag\{([^}]*)\}", out), ["5", "6"])
+        self.assertEqual(conv.eq_last, "6")
+        # only row "w = 4" (the numbered one) carries the tag
+        self.assertIn("w = 4 \\tag{6}", out)
+
     def test_starred_align_rows_stay_unnumbered(self):
         tex = "\\begin{align*}\ny &= 2 \\\\\nz &= 3\n\\end{align*}"
         out, flags, conv = self.convert(tex)
@@ -361,6 +380,32 @@ class DollarDisplayMath(unittest.TestCase):
         self.assertIn("$e+f$", md)
         self.assertIn("## Later", md)
         self.assertEqual([f["kind"] for f in flags if f["kind"] == "escaping-regime"], [])
+
+
+class LeftoverCommandStripping(unittest.TestCase):
+    r"""do_text()'s final sweep drops layout commands that carry no content
+    (\allowdisplaybreaks, \noindent, ...). The regex used to allow an
+    optional "\*?" after the command name for a starred variant -- none of
+    these commands actually has one -- and "\s*\*?\s*" reaches across a
+    blank line, so a command sitting right before a "**bold**" heading (a
+    diagram equation's own "**Equation N:**" header, immediately following
+    \allowdisplaybreaks in the wild) ate the heading's first "*".
+    """
+
+    def strip(self, s):
+        class _Args:
+            style_map, drop_color = {}, False
+        conv = paper2md.Converter(paper2md.Preamble(""), {}, {}, _Args())
+        return conv.do_text(s)
+
+    def test_does_not_eat_a_following_bold_heading(self):
+        out = self.strip("text.\n\\allowdisplaybreaks\n\n**Equation 5:**\n\nmore")
+        self.assertIn("**Equation 5:**", out)
+        self.assertNotIn("*Equation 5:**", out.replace("**Equation 5:**", ""))
+
+    def test_command_itself_still_removed(self):
+        out = self.strip("a \\noindent b")
+        self.assertNotIn("\\noindent", out)
 
 
 class TableFloats(unittest.TestCase):

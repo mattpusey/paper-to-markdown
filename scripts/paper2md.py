@@ -1400,6 +1400,25 @@ class Converter:
         fenced block, not math -- no longer has.
         """
         rows = self._split_display_rows(inner)
+
+        # \label placed on a \nonumber row -- routinely how a paper marks up
+        # \begin{align}\label{X} right at the top, with the actual numbered
+        # row coming later once the \nonumber rows above it are done -- does
+        # not describe THAT row (LaTeX never assigns it a number, so \label
+        # there could not sensibly ref that row); move it onto the next row
+        # that isn't itself \nonumber, which is where the real numbering (and
+        # the label's real target) actually lands.
+        pending = []
+        for i, row in enumerate(rows):
+            if re.search(r"\\nonumber\b|\\notag\b", row):
+                found = re.findall(r"\\label\s*\{([^}]*)\}", row)
+                if found:
+                    rows[i] = re.sub(r"\\label\s*\{[^}]*\}", "", row)
+                    pending.extend(found)
+            elif pending:
+                rows[i] = "".join("\\label{%s}" % l for l in pending) + rows[i]
+                pending = []
+
         in_sub = "subequations" in anc
         parts, group = [], []
 
@@ -1663,11 +1682,18 @@ class Converter:
         # Whatever is left takes no argument. The single regex this replaced
         # offered an optional {[^}]*} to ALL of them, so \centering followed by
         # a brace group swallowed the group -- with a whole table inside it.
+        # None of these commands have a starred variant in real LaTeX, so the
+        # optional "\*?" that used to sit here is not needed -- and is
+        # actively dangerous: "\s*\*?\s*" reaches across a blank line, so
+        # "\allowdisplaybreaks\n\n**Equation 5:**" (a real sequence: the
+        # command sits right before a diagram-equation's own bold header)
+        # consumed the FIRST "*" of the following "**", leaving a corrupted
+        # "*Equation 5:**" behind.
         s = re.sub(r"\\(?:label|nocite|bibliographystyle|bibliography|maketitle|centering"
                    r"|setlength|setcounter|addtolength|counterwithin|renewcommand"
                    r"|vspace|hspace|bigskip|medskip|smallskip|noindent|onecolumn|twocolumn"
                    r"|onecolumngrid|twocolumngrid|allowdisplaybreaks"
-                   r"|appendix|FloatBarrier|center|par)\b\s*\*?\s*(\[[^\]]*\])?", "", s)
+                   r"|appendix|FloatBarrier|center|par)\b\s*(\[[^\]]*\])?", "", s)
         s = re.sub(r"\\begin\{(document|strip|abstract|center|subfigure)\}", "", s)
         s = re.sub(r"\\end\{(document|strip|abstract|center|subfigure)\}", "", s)
         if self.args.drop_color:
