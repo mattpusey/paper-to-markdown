@@ -255,6 +255,23 @@ class MultirowAlign(unittest.TestCase):
         self.assertIn("**Equation 6:**", out)
         self.assertEqual(conv.eq_last, "6")
 
+    def test_diagram_row_and_plain_math_row_each_get_their_own_number(self):
+        # The exact shape that exposed the bug: one row is a diagram
+        # identity, the NEXT row (same align, no \nonumber) is plain math
+        # continuing it ("= scalar value") -- both need their own number,
+        # not one number for the whole block.
+        tex = ("\\begin{equation}\\label{a} x = 1 \\end{equation}\n"
+               "\\begin{align}\n"
+               "\\begin{tikzpicture}\\node (0) at (0,0) {};\\end{tikzpicture}\\\\\n"
+               "&= 2\n"
+               "\\end{align}")
+        out, flags, conv = self.convert(tex, {"a": "5"})
+        self.assertIn("**Equation 6:**", out)
+        self.assertEqual(re.findall(r"\\tag\{([^}]*)\}", out), ["5", "7"])
+        self.assertEqual(conv.eq_last, "7")
+        # the diagram row's dropped "&" doesn't survive into the fenced block
+        self.assertNotIn("&", out.split("**Equation 6:**")[1].split("```")[1])
+
     def test_starred_align_rows_stay_unnumbered(self):
         tex = "\\begin{align*}\ny &= 2 \\\\\nz &= 3\n\\end{align*}"
         out, flags, conv = self.convert(tex)

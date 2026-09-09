@@ -1294,13 +1294,14 @@ class Converter:
                 # align/gather/eqnarray number EVERY ROW by default in real
                 # LaTeX (unlike equation/multline, which are one number
                 # regardless of how many \\-separated lines they contain) --
-                # unless a row carries \nonumber/\notag. A tikzpicture inside
-                # one of these still gets the figure-like single-number
+                # unless a row carries \nonumber/\notag. A row with its own
+                # tikzpicture still gets the figure-like single-number
                 # treatment (matching how a figure is captioned once, not
-                # per sub-panel); per-row numbering only applies when there
-                # is no diagram to render instead.
-                if (env in ("align", "gather", "eqnarray")
-                        and not env_spans(inner, {"tikzpicture"})):
+                # per sub-panel) -- _render_multirow_align() decides that
+                # per ROW, not for the block as a whole, so a diagram row
+                # sitting next to plain math rows doesn't swallow their
+                # numbers too.
+                if env in ("align", "gather", "eqnarray"):
                     return self._render_multirow_align(inner, anc, env)
 
                 labs = re.findall(r"\\label\s*\{([^}]*)\}", inner)
@@ -1386,18 +1387,38 @@ class Converter:
         document then derives from the wrong baseline -- a four-number
         undercount from one five-row align is enough to misnumber every
         unlabelled equation for the rest of the paper.
+
+        A row containing its own tikzpicture is rendered through
+        _render_diagram_equation() individually -- a diagram interleaved
+        with OTHER rows in one align is still one row with its own number,
+        not license to fold the whole block into a single figure-like
+        unit -- which also breaks it out of the shared $$\\begin{aligned}
+        block (KaTeX math can't contain one), closing that block before the
+        diagram and opening a fresh one for whatever rows follow. The row's
+        own "&" alignment marks are dropped in that case: they format columns
+        against sibling ALIGNED rows, which a diagram row -- rendered as a
+        fenced block, not math -- no longer has.
         """
         rows = self._split_display_rows(inner)
         in_sub = "subequations" in anc
-        out_rows = []
+        parts, group = [], []
+
+        def flush_group():
+            if group:
+                parts.append(self.stash(
+                    "$$\n\\begin{aligned}%s\\end{aligned}\n$$" % "\\\\\n".join(group)))
+                group.clear()
+
         for row in rows:
             labs = re.findall(r"\\label\s*\{([^}]*)\}", row)
             nonum = bool(re.search(r"\\nonumber\b|\\notag\b", row))
             tag = ""
+            eq_num = None
             if labs:
                 num = self.labels.get(labs[0])
                 if num:
                     tag = " \\tag{%s}" % num
+                    eq_num = num
                     self.eq_last = num
                 else:
                     flag("equation-unnumbered",
@@ -1414,6 +1435,7 @@ class Converter:
                 derived = next_eq_number(prev, in_sub)
                 if derived:
                     tag = " \\tag{%s}" % derived
+                    eq_num = derived
                     self.eq_last = derived
                     flag("equation-derived-number",
                          f"unlabelled {env} row numbered {derived}, continuing "
@@ -1426,9 +1448,16 @@ class Converter:
                          f"continue from — row emitted without a number", row)
             row = re.sub(r"\\label\s*\{[^}]*\}", "", row)
             row = re.sub(r"\\nonumber\b|\\notag\b", "", row)
-            out_rows.append(row.rstrip() + tag)
-        inner_out = "\\\\\n".join(out_rows)
-        return self.stash("$$\n\\begin{aligned}%s\\end{aligned}\n$$" % inner_out)
+
+            if env_spans(row, {"tikzpicture"}):
+                flush_group()
+                diagram = self._render_diagram_equation(row.replace("&", ""), eq_num)
+                parts.append(diagram if diagram is not None
+                             else self.stash("$%s$" % row.strip()))
+            else:
+                group.append(row.rstrip() + tag)
+        flush_group()
+        return "".join(parts)
 
     def _stash_math(self, s):
         r"""$...$, $$...$$, \[...\] and \(...\) -> placeholders, in ONE walk.
