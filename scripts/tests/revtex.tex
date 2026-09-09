@@ -1,0 +1,27 @@
+% Regression fixture: REVTeX-style frontmatter AFTER \begin{document}, the
+% way revtex4-1/4-2 wants it. Compiles with:  pdflatex revtex
+% (no labels and no bibliography, so no .aux/.bbl is needed).
+\documentclass[aps,prl]{revtex4-2}
+\newcommand{\JQI}{Joint Quantum Institute, College Park}
+\begin{document}
+
+\title{Frontmatter after the document begins:\\ a two-line \emph{title}}
+
+\author{Ada Lovelace}
+\email{ada@example.edu}
+\affiliation{\JQI}
+\author{Kurt G\"{o}del}
+\affiliation{Institute for Advanced Study, Princeton~NJ}
+\affiliation{\JQI}
+\date{12 March 2020}
+\pacs{03.67.-a}
+
+\begin{abstract}
+An abstract that must survive exactly where it sits.
+\end{abstract}
+
+\maketitle
+
+Body text follows, with an equation $E = mc^2$ in it.
+
+\end{document}

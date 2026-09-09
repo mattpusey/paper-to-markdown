@@ -791,5 +791,166 @@ class ProofMacros(unittest.TestCase):
         self.assertEqual(out, r"\begin{proof} a = b \end{proof}")
 
 
+class BodyFrontmatter(unittest.TestCase):
+    r"""REVTeX classes put \title/\author/\affiliation AFTER
+    \begin{document}. Harvesting the preamble alone found no title at all on
+    those papers -- `no-title', no heading, no author list -- and left the
+    whole block in the body, where nothing else claims those commands, so
+    they leaked into the markdown as raw LaTeX."""
+
+    def strip(self, pre_txt, body):
+        pre = paper2md.Preamble(pre_txt)
+        before = len(paper2md.FLAGS)
+        out = paper2md.adopt_body_frontmatter(pre, body)
+        flags = [f["kind"] for f in paper2md.FLAGS[before:]]
+        del paper2md.FLAGS[before:]
+        return pre, out, flags
+
+    def test_end_to_end(self):
+        md, flags = convert("revtex")
+        kinds = [f["kind"] for f in flags]
+        self.assertNotIn("no-title", kinds)
+        self.assertEqual(paper2md.run_checks(md), 0)
+        self.assertIn("# Frontmatter after the document begins: "
+                      "a two-line *title*", md)
+        # affiliations numbered positionally, Godel's own first
+        self.assertIn("**Ada Lovelace**<sup>1</sup>, "
+                      "**Kurt G\u00f6del**<sup>2,1</sup>", md)
+        self.assertIn("<sup>1</sup> Joint Quantum Institute, College Park", md)
+        self.assertIn("<sup>2</sup> Institute for Advanced Study, "
+                      "Princeton NJ", md)
+        self.assertIn("Contact: Ada Lovelace <ada@example.edu>", md)
+        self.assertIn("*12 March 2020*", md)
+        # the abstract lives inside the block and must not be taken with it
+        self.assertIn("An abstract that must survive exactly where it sits.", md)
+        # nothing of the block itself survives as LaTeX
+        for cmd in (r"\title", r"\author", r"\affiliation", r"\email",
+                    r"\date", r"\pacs", r"\JQI"):
+            self.assertNotIn(cmd, md)
+        self.assertIn("frontmatter-dropped", kinds)   # \pacs is not emitted
+
+    def test_frontmatter_commands_are_removed_from_the_body(self):
+        pre, out, _ = self.strip("", "\n".join([
+            r"\title{T}", r"\author{A}", r"\affiliation{Inst}",
+            r"\begin{abstract}Keep me.\end{abstract}", r"\maketitle",
+            r"\section{One}", r"Prose."]))
+        self.assertEqual(pre.title, "T")
+        self.assertNotIn(r"\title", out)
+        self.assertNotIn(r"\affiliation", out)
+        self.assertIn("Keep me.", out)
+        self.assertIn(r"\section{One}", out)
+        self.assertIn("Prose.", out)
+
+    def test_only_the_frontmatter_region_is_scanned(self):
+        r"""A \title-looking command after \maketitle is prose's problem, not
+        the harvest's -- the body past \maketitle is returned untouched."""
+        pre, out, _ = self.strip("", r"\maketitle" + "\n" + r"\author{Late}")
+        self.assertEqual(pre.authors, [])
+        self.assertIn(r"\author{Late}", out)
+
+    def test_preamble_frontmatter_wins_and_body_duplicate_is_flagged(self):
+        pre, out, flags = self.strip(r"\title{Preamble}",
+                                     r"\title{Body}\author{A}\maketitle")
+        self.assertEqual(pre.title, "Preamble")
+        self.assertNotIn(r"\title", out)
+        self.assertIn("frontmatter-duplicate", flags)
+
+    def test_a_paper_with_no_frontmatter_in_the_body_is_untouched(self):
+        body = "\\maketitle\nProse with an \\author-free body.\n"
+        pre, out, _ = self.strip(r"\title{T}\author{A}", body)
+        self.assertEqual(out, body)
+        self.assertEqual(pre.authors, [("", "A")])
+
+
+class FrontmatterHarvest(unittest.TestCase):
+    """One scanner reads the title block wherever it sits, so the REVTeX
+    positional author/affiliation convention and authblk's explicit keys
+    both have to come out of it."""
+
+    def fm(self, text):
+        before = len(paper2md.FLAGS)
+        f = paper2md.Frontmatter(text)
+        f.flags = [x["kind"] for x in paper2md.FLAGS[before:]]
+        del paper2md.FLAGS[before:]
+        return f
+
+    def test_affiliations_bind_to_the_preceding_author_group(self):
+        f = self.fm(r"\author{A}\author{B}\affiliation{X}"
+                    r"\author{C}\affiliation{Y}")
+        self.assertEqual(f.authors, [("1", "A"), ("1", "B"), ("2", "C")])
+        self.assertEqual(f.affils, [("1", "X"), ("2", "Y")])
+
+    def test_one_author_can_carry_several_affiliations(self):
+        f = self.fm(r"\author{A}\affiliation{X}\affiliation{Y}")
+        self.assertEqual(f.authors, [("1,2", "A")])
+
+    def test_a_repeated_affiliation_keeps_one_number(self):
+        """Both authors sit at the same institute, spelled out twice -- one
+        affiliation line, and (being the only one) no superscripts."""
+        f = self.fm(r"\author{A}\affiliation{X}\author{B}\affiliation{X}")
+        self.assertEqual(f.affils, [("", "X")])
+        self.assertEqual(f.authors, [("", "A"), ("", "B")])
+
+    def test_a_repeated_affiliation_is_numbered_once_among_several(self):
+        f = self.fm(r"\author{A}\affiliation{X}\author{B}\affiliation{Y}"
+                    r"\affiliation{X}")
+        self.assertEqual(f.affils, [("1", "X"), ("2", "Y")])
+        self.assertEqual(f.authors, [("1", "A"), ("2,1", "B")])
+
+    def test_a_single_shared_affiliation_needs_no_superscripts(self):
+        f = self.fm(r"\author{A}\author{B}\affiliation{X}")
+        self.assertEqual(f.authors, [("", "A"), ("", "B")])
+        self.assertEqual(f.affils, [("", "X")])
+
+    def test_authblk_explicit_keys_are_kept(self):
+        f = self.fm(r"\author[1]{A}\author[2]{B}\affil[1]{X}\affil[2]{Y}")
+        self.assertEqual(f.authors, [("1", "A"), ("2", "B")])
+        self.assertEqual(f.affils, [("1", "X"), ("2", "Y")])
+
+    def test_and_separates_authors_inside_one_author_command(self):
+        f = self.fm(r"\author{A. One \and B. Two}")
+        self.assertEqual(f.authors, [("", "A. One"), ("", "B. Two")])
+
+    def test_email_is_attributed_to_the_author_it_follows(self):
+        f = self.fm(r"\author{A}\email{a@x}\author{B}")
+        self.assertEqual(f.emails, [("A", "a@x")])
+
+    def test_a_collaboration_never_owns_an_email(self):
+        r"""\collaboration prints in the author list but is a group name, so
+        an \email after it still belongs to the last real author."""
+        f = self.fm(r"\author{A}\collaboration{The C}\email{a@x}")
+        self.assertEqual(f.emails, [("A", "a@x")])
+        self.assertEqual([n for _, n in f.authors], ["A", "The C"])
+
+    def test_today_is_not_a_date(self):
+        self.assertIsNone(self.fm(r"\date{\today}").date)
+        self.assertEqual(self.fm(r"\date{1 May 2021}").date, "1 May 2021")
+
+    def test_a_two_line_title_loses_its_line_break_not_a_backslash(self):
+        r"""A bare "\\" left in the title is an escaping-regime violation in
+        the heading block, which do_text() never sees."""
+        f = self.fm(r"\title{First line\\[2mm] second line}")
+        self.assertEqual(f.title, "First line second line")
+
+    def test_nonbreaking_spaces_do_not_survive_as_tildes(self):
+        f = self.fm(r"\affiliation{Princeton~NJ}")
+        self.assertEqual(f.affils, [("", "Princeton NJ")])
+
+    def test_a_thanks_footnote_is_not_part_of_the_name(self):
+        f = self.fm(r"\author{A. One\thanks{Now at B}}")
+        self.assertEqual(f.authors, [("", "A. One")])
+        self.assertIn("frontmatter-dropped", f.flags)
+
+    def test_unemitted_frontmatter_is_flagged_not_silently_dropped(self):
+        f = self.fm(r"\keywords{one, two}")
+        self.assertIn("frontmatter-dropped", f.flags)
+
+    def test_an_autolinked_address_is_not_an_escaping_violation(self):
+        before = len(paper2md.FLAGS)
+        n = paper2md.run_checks("Contact: A. One <first_last@example.edu>")
+        del paper2md.FLAGS[before:]
+        self.assertEqual(n, 0)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
