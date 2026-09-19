@@ -1133,5 +1133,68 @@ class CodeSpanEscaping(unittest.TestCase):
         self.assertEqual(self.check(r"The script `teleport\_capacity.py` runs."), 1)
 
 
+class RomanLabels(unittest.TestCase):
+    r"""enumitem's \roman*/\Roman* labels, for a list long enough to reach
+    the subtractive forms. A reduced numeral table spelled 40 "xxxx", which
+    is both wrong and unmatched by the prose citing item (xl)."""
+
+    def test_subtractive_forms(self):
+        for n, expect in [(1, "i"), (4, "iv"), (9, "ix"), (14, "xiv"),
+                          (39, "xxxix"), (40, "xl"), (49, "xlix"), (50, "l"),
+                          (90, "xc"), (99, "xcix"), (100, "c"), (400, "cd"),
+                          (1994, "mcmxciv")]:
+            self.assertEqual(paper2md._roman(n), expect, n)
+
+    def test_the_label_function_uses_them(self):
+        fn = paper2md._enum_label_fn(r"label=(\roman*)")
+        self.assertEqual(fn(40), "(xl)")
+        upper = paper2md._enum_label_fn(r"label=(\Roman*)")
+        self.assertEqual(upper(40), "(XL)")
+
+
+class Restore(unittest.TestCase):
+    """restore() is keyed on the placeholder pattern, not on trying every
+    stored key against every line: a long paper stashes thousands of blocks,
+    and the store also holds __restate__, whose value is a dict."""
+
+    def conv(self, **store):
+        c = paper2md.Converter.__new__(paper2md.Converter)
+        c.store, c.n = dict(store), 0
+        return c
+
+    def test_a_multiline_block_inherits_the_quote_marker(self):
+        c = self.conv()
+        key = c.stash("$$\nx = 1\n$$")
+        self.assertEqual(c.restore("> " + key),
+                         "> \n>\n> $$\n> x = 1\n> $$\n>\n>")
+
+    def test_an_unquoted_block_is_untouched(self):
+        c = self.conv()
+        key = c.stash("$$\nx = 1\n$$")
+        self.assertEqual(c.restore(key), "\n\n$$\nx = 1\n$$\n\n")
+
+    def test_a_non_text_store_entry_is_not_a_substitution(self):
+        c = self.conv(__restate__={"Thm": "body"})
+        key = c.stash("kept")
+        self.assertEqual(c.restore("a __restate__ b " + key), "a __restate__ b kept")
+
+    def test_an_unknown_placeholder_is_left_alone(self):
+        c = self.conv()
+        self.assertEqual(c.restore("x \x00PM99\x00 y"), "x \x00PM99\x00 y")
+
+    def test_backslashes_in_a_restored_block_survive_substitution(self):
+        r"""A function repl is used literally; a string one would read
+        \1 and \g in the restored LaTeX as group references."""
+        c = self.conv()
+        key = c.stash(r"$\alpha \1 \g$")
+        self.assertEqual(c.restore("see " + key), r"see $\alpha \1 \g$")
+
+    def test_a_block_holding_a_placeholder_still_resolves(self):
+        c = self.conv()
+        inner = c.stash("INNER")
+        outer = c.stash("outer(%s)" % inner)
+        self.assertEqual(c.restore(outer), "outer(INNER)")
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

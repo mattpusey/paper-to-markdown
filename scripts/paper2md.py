@@ -254,7 +254,9 @@ def env_body(s, node):
     return s[first.pos:last.pos + last.len]
 
 
-_ROMAN = [(10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")]
+_ROMAN = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"),
+          (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+          (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")]
 
 
 def _roman(n):
@@ -339,6 +341,12 @@ def _indent_continuations(text, pad):
 
 
 _QUOTE_PREFIX = re.compile(r"^(?:>\s?)+")
+
+# One stashed block. NUL-delimited so it cannot collide with anything in a
+# paper, and matchable so restore() can find the placeholders in a line
+# instead of testing the whole store against it.
+PLACEHOLDER = "\x00PM%d\x00"
+PLACEHOLDER_RE = re.compile("\x00PM\\d+\x00")
 
 
 def blockquote(body):
@@ -1552,7 +1560,7 @@ class Converter:
 
     def stash(self, text):
         self.n += 1
-        key = f"\x00PM{self.n}\x00"
+        key = PLACEHOLDER % self.n
         # a $$ block must sit alone between blank lines or the checker (and most
         # renderers) will not recognise it as display math
         if text.startswith("$$"):
@@ -1561,11 +1569,17 @@ class Converter:
         return key
 
     def restore(self, s):
+        # Found by pattern rather than by trying every key against every
+        # line: a long paper stashes thousands of blocks, and the store also
+        # holds __restate__, whose value is a dict and not text at all.
         for _ in range(6):
-            if not any(k in s for k in self.store):
+            if not PLACEHOLDER_RE.search(s):
                 break
             lines = []
             for ln in s.split("\n"):
+                if PLACEHOLDER_RE.search(ln) is None:
+                    lines.append(ln)
+                    continue
                 # A placeholder standing on a quoted line is a display block
                 # (or a fenced figure) inside a theorem: it restores to
                 # several lines, and without the quote marker carried onto
@@ -1573,15 +1587,19 @@ class Converter:
                 # belongs to, both visually and for every structural check.
                 m = _QUOTE_PREFIX.match(ln)
                 pre = m.group(0).rstrip() + " " if m else ""
-                for k, v in self.store.items():
-                    if k not in ln:
-                        continue
+
+                def one(hit, pre=pre):
+                    v = self.store.get(hit.group(0))
+                    if v is None:                 # not ours; leave it alone
+                        return hit.group(0)
                     if pre and "\n" in v:
                         head, *rest = v.split("\n")
                         v = "\n".join([head] + [(pre + x).rstrip() if x.strip()
                                                 else pre.rstrip() for x in rest])
-                    ln = ln.replace(k, v)
-                lines.append(ln)
+                    return v
+                # A function repl is substituted literally, so the backslashes
+                # a restored block is made of stay as they are.
+                lines.append(PLACEHOLDER_RE.sub(one, ln))
             s = "\n".join(lines)
         return s
 
