@@ -1,0 +1,49 @@
+% Regression fixture: the structural constructs of a theorem-proof paper
+% that carries its own bibliography. Each one below was lost, leaked or
+% corrupted before the test alongside it existed. structure.aux is committed
+% so the test needs no LaTeX toolchain; regenerate it with
+%   pdflatex -interaction=nonstopmode structure
+\documentclass{article}
+\usepackage{amsmath,amsthm,enumitem}
+\newtheorem{lemma}{Lemma}[section]
+\newcommand{\Neg}{N}
+\newcommand{\ket}[1]{|#1\rangle}
+\DeclareMathOperator{\Tr}{Tr}
+\title{A short title\\[1ex] {\large And its subtitle}}
+\date{Written up in \texttt{notes/x\_1.md} (March 2026)}
+\begin{document}
+\maketitle
+
+\section{Statements}\label{sec:stmt}
+
+A bracket after an operator is an argument, not an option: $\Tr[\rho]$ and
+$\Tr[\Lambda\rho]\ket\psi$. A macro expanding to a letter must not weld
+itself onto the command in front of it: $\Neg(\sigma)\le\Neg(\tau)$.
+
+\begin{quote}
+\textbf{The question.} Is it so?
+\end{quote}
+
+\begin{lemma}[properties]\label{lem:props}
+Let $\sigma$ be PSD.
+\begin{enumerate}[label=(\alph*),nosep]
+\item First part, cited elsewhere as Lemma~\ref{lem:props}(a).
+\item Second part, with a display of its own:
+\[
+  \sigma = \sigma^{T}.
+\]
+\end{enumerate}
+\end{lemma}
+
+\begin{proof}[Proof of Lemma~\ref{lem:props}]
+Immediate, as ``everyone'' knows --- see items (N1)--(N3) of~\cite{two}.
+\end{proof}
+
+\paragraph{Relation to the notes.} This expands \texttt{notes/x\_1.md}.
+
+\begin{thebibliography}{9}
+\bibitem{one} A. Author, \emph{A title}, J. Phys. \textbf{1}, 1 (2001).
+\bibitem{two} B. Writer, \emph{Another title}, J. Phys. \textbf{2}, 2 (2002).
+\end{thebibliography}
+
+\end{document}

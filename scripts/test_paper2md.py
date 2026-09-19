@@ -952,5 +952,186 @@ class FrontmatterHarvest(unittest.TestCase):
         self.assertEqual(n, 0)
 
 
+class MacroArgumentBoundaries(unittest.TestCase):
+    r"""expand_macros() has to reproduce TeX's token boundaries, in both
+    directions, without inventing an optional argument nobody declared."""
+
+    def expand(self, src, macros=None):
+        return paper2md.expand_macros(src, macros or {})
+
+    def test_a_bracket_after_a_macro_is_not_an_optional_argument(self):
+        r"""\Tr[\rho] is an operator applied to a bracketed argument. The
+        bracket used to be eaten as an option, deleting the operand in
+        silence: 33 of them went missing from one paper, and nothing
+        downstream -- KaTeX included -- could see that anything had."""
+        ops = {"\\Tr": (0, r"\operatorname{Tr}")}
+        self.assertEqual(self.expand(r"$\Tr[\rho]$", ops),
+                         r"$\operatorname{Tr}[\rho]$")
+        self.assertEqual(self.expand(r"$r_i=\Tr[\sigma_i\rho]$", ops),
+                         r"$r_i=\operatorname{Tr}[\sigma_i\rho]$")
+
+    def test_smashoperator_still_loses_its_real_option(self):
+        self.assertEqual(self.expand(r"$\smashoperator[r]{\sum_i}$"),
+                         r"$\sum_i$")
+
+    def test_expansion_does_not_weld_onto_the_command_in_front(self):
+        r"""\le\Neg(x) with \Neg -> N came out as the undefined "\leN"."""
+        self.assertEqual(self.expand(r"$a\le\Neg(b)$", {"\\Neg": (0, "N")}),
+                         r"$a\le N(b)$")
+
+    def test_expansion_still_does_not_weld_onto_what_follows(self):
+        self.assertEqual(self.expand(r"$\ot N$", {"\\ot": (0, r"\otimes")}),
+                         r"$\otimes N$")
+
+    def test_a_braceless_single_token_argument_is_grabbed(self):
+        r"""\ket\psi is how TeX reads it, and physics papers write it."""
+        kets = {"\\ket": (1, r"|#1\rangle")}
+        self.assertEqual(self.expand(r"$\ket\psi$", kets), r"$|\psi\rangle$")
+        self.assertEqual(self.expand(r"$\ket0$", kets), r"$|0\rangle$")
+        self.assertEqual(self.expand(r"$\ket{01}$", kets), r"$|01\rangle$")
+
+
+class EnvironmentOptionalArgument(unittest.TestCase):
+    r"""\begin{lemma}[branches] -- the bracket is the only part of the
+    heading the author wrote. pylatexenc parses it into the node's
+    arguments, so env_body() (which spans the child nodes) never saw it and
+    every theorem name was dropped without a flag."""
+
+    def test_theorem_note_survives(self):
+        md, _ = convert("structure", "--aux", "structure.aux")
+        self.assertIn("**Lemma 1.1 (properties).**", md)
+
+    def test_a_named_proof_keeps_its_name(self):
+        md, _ = convert("structure", "--aux", "structure.aux")
+        self.assertIn("*Proof of Lemma 1.1.*", md)
+        self.assertNotIn("*Proof.* Immediate", md)
+
+
+class Lists(unittest.TestCase):
+    """enumitem options leaked as prose and every list came out as bullets,
+    losing the (a)/(i) labels the paper's own cross-references use."""
+
+    def setUp(self):
+        self.md, self.flags = convert("structure", "--aux", "structure.aux")
+
+    def test_the_option_list_is_not_prose(self):
+        self.assertNotIn("label=", self.md)
+        self.assertNotIn("nosep", self.md)
+
+    def test_alph_labels_are_printed(self):
+        self.assertIn("- (a) First part", self.md)
+        self.assertIn("- (b) Second part", self.md)
+
+    def test_items_stay_inside_the_theorem_that_states_them(self):
+        for line in self.md.split("\n"):
+            if "First part" in line or "Second part" in line:
+                self.assertTrue(line.startswith(">"), line)
+
+    def test_a_display_inside_a_theorem_stays_inside_it(self):
+        """The block is a placeholder when the quoting runs, so it restored
+        as unquoted lines and the equation fell out of the theorem."""
+        self.assertIn("> $$", self.md)
+
+    def test_plain_enumerate_is_numbered(self):
+        md = paper2md.Converter.__new__(paper2md.Converter)
+        out = paper2md.Converter._lists(
+            md, "\\begin{enumerate}\n\\item one\n\\item two\n\\end{enumerate}")
+        self.assertIn("1. one", out)
+        self.assertIn("2. two", out)
+
+    def test_description_items_keep_their_term(self):
+        md = paper2md.Converter.__new__(paper2md.Converter)
+        out = paper2md.Converter._lists(
+            md, "\\begin{description}\n\\item[Term] body\n\\end{description}")
+        self.assertIn("- **Term** body", out)
+
+
+class QuotesParagraphsAndDashes(unittest.TestCase):
+
+    def setUp(self):
+        self.md, _ = convert("structure", "--aux", "structure.aux")
+
+    def test_quote_environment_becomes_a_blockquote(self):
+        self.assertNotIn("\\begin{quote}", self.md)
+        self.assertIn("> **The question.** Is it so?", self.md)
+
+    def test_paragraph_is_a_bold_run_in_heading(self):
+        self.assertNotIn("\\paragraph", self.md)
+        self.assertIn("**Relation to the notes.** This expands", self.md)
+
+    def test_tex_quotes_become_curly_ones(self):
+        """``x'' opens a Markdown CODE SPAN, swallowing the sentence."""
+        self.assertNotIn("``", self.md)
+        self.assertIn("\u201ceveryone\u201d", self.md)
+
+    def test_double_hyphen_is_an_en_dash(self):
+        self.assertIn("(N1)\u2013(N3)", self.md)
+
+    def test_a_code_span_keeps_its_double_hyphen(self):
+        self.assertEqual(paper2md.dashes("run `x --flag` now -- see"),
+                         "run `x --flag` now \u2013 see")
+
+
+class TitleAndDate(unittest.TestCase):
+
+    def test_a_size_declared_trailing_group_is_a_subtitle(self):
+        self.assertEqual(paper2md.split_subtitle(r"Main {\large Sub}"),
+                         ("Main", "Sub"))
+        self.assertEqual(paper2md.split_subtitle("Main only"),
+                         ("Main only", None))
+
+    def test_the_subtitle_is_emitted_under_the_heading(self):
+        md, _ = convert("structure", "--aux", "structure.aux")
+        self.assertIn("# A short title\n\n*And its subtitle*", md)
+
+    def test_a_date_carrying_markup_is_not_thrown_away(self):
+        r"""The guard was "no backslash in the value", so \date{... \texttt{x}
+        ...} was dropped whole, silently."""
+        md, _ = convert("structure", "--aux", "structure.aux")
+        self.assertIn("March 2026", md)
+
+    def test_today_is_still_dropped(self):
+        f = paper2md.Frontmatter(r"\date{\today}")
+        self.assertIsNone(f.date)
+
+
+class InlineBibliography(unittest.TestCase):
+    r"""A paper with no .bib carries \begin{thebibliography} in the source.
+    It used to leak as raw LaTeX and every \cite fell back to its key."""
+
+    def setUp(self):
+        self.md, self.flags = convert("structure", "--aux", "structure.aux")
+
+    def test_the_environment_does_not_leak(self):
+        self.assertNotIn("thebibliography", self.md)
+        self.assertNotIn("\\bibitem", self.md)
+
+    def test_citations_are_numbered(self):
+        self.assertIn("of [2]", self.md)
+        self.assertNotIn("[two]", self.md)
+
+    def test_a_reference_list_is_emitted(self):
+        self.assertIn("## References", self.md)
+        self.assertIn("[1] A. Author, *A title*, J. Phys. **1**, 1 (2001).", self.md)
+
+    def test_no_bbl_is_not_flagged_when_the_source_carries_one(self):
+        self.assertNotIn("no-bbl", {f["kind"] for f in self.flags})
+
+
+class CodeSpanEscaping(unittest.TestCase):
+
+    def check(self, md):
+        before = len(paper2md.FLAGS)
+        n = paper2md.run_checks(md)
+        del paper2md.FLAGS[before:]
+        return n
+
+    def test_an_underscore_in_a_code_span_is_not_a_violation(self):
+        self.assertEqual(self.check("The script `teleport_capacity.py` runs."), 0)
+
+    def test_a_latex_escape_in_a_code_span_still_is(self):
+        self.assertEqual(self.check(r"The script `teleport\_capacity.py` runs."), 1)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)

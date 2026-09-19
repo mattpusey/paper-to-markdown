@@ -254,5 +254,65 @@ class EndToEnd(unittest.TestCase):
         self.assertIn("nonlocal", missing)
 
 
+class LineBreakIsNotADisplayOpener(unittest.TestCase):
+    r"""\\[1ex] ends in "\[", which the display-math regex took for the
+    opener of a \[...\] block and matched to the next real \], blanking
+    every word in between. On one paper that was the abstract and the whole
+    of section 1 -- so the check that exists to catch a silent omission was
+    itself silently omitting, and reported the missing words back as
+    inventions on the markdown side."""
+
+    def test_a_spaced_line_break_does_not_swallow_the_text_after_it(self):
+        words = tex_prose(r"""\documentclass{article}
+\title{First line\\[1ex] {\large Second line}}
+\begin{document}
+\maketitle
+Alpha beta gamma.
+\[ x = 1 \]
+Delta epsilon.
+\end{document}""")
+        for w in ("alpha", "beta", "gamma", "delta", "epsilon"):
+            self.assertIn(w, words)
+
+    def test_real_display_math_is_still_dropped(self):
+        words = tex_prose(r"""\documentclass{article}
+\begin{document}
+Alpha.
+\[ \mathrm{swallowed} = 1 \]
+Beta.
+\end{document}""")
+        self.assertIn("alpha", words)
+        self.assertIn("beta", words)
+        self.assertNotIn("swallowed", words)
+
+
+class TheoremNotesArePrinted(unittest.TestCase):
+    r"""\begin{lemma}[branches] prints "Lemma 1 (branches)", so the bracket
+    is prose. BEGIN_END_RE took it with the \begin, and every theorem name
+    the converter now keeps was reported as an invention."""
+
+    def test_a_theorem_note_counts_as_source_prose(self):
+        words = tex_prose(r"""\documentclass{article}
+\newtheorem{lemma}{Lemma}
+\begin{document}
+\begin{lemma}[properties of the negativity]
+Body.
+\end{lemma}
+\end{document}""")
+        self.assertIn("properties", words)
+        self.assertIn("negativity", words)
+
+    def test_an_option_list_is_still_not_prose(self):
+        words = tex_prose(r"""\documentclass{article}
+\usepackage{graphicx}
+\begin{document}
+\begin{figure}[htbp]
+\caption{A caption.}
+\end{figure}
+\end{document}""")
+        self.assertIn("caption", words)
+        self.assertNotIn("htbp", words)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
