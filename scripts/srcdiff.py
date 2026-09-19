@@ -224,6 +224,13 @@ DROP_ENVS = ["tikzpicture", "pgfpicture", "axis", "verbatim", "lstlisting",
              "matrix", "pmatrix", "bmatrix", "vmatrix", "Bmatrix", "smallmatrix",
              "split", "cases", "subequations", "thebibliography", "picture"]
 
+# A line break with optional extra leading, \\[1ex], ends in "\[" — which
+# TEX_DISPLAY_RE below would take for the OPENER of a display, then run to
+# the next real \] and blank every word in between. A title set as
+# "\title{Main\\[1ex] {\large Sub}}" did exactly that: the abstract and the
+# whole of section 1 vanished from the source side, so the one check that
+# exists to catch a silent omission was silently omitting.
+TEX_LINEBREAK_RE = re.compile(r"\\\\\s*\*?\s*(?:\[[^\]]*\])?")
 TEX_DISPLAY_RE = re.compile(r"\\\[[\s\S]*?\\\]|\$\$[\s\S]*?\$\$")
 TEX_INLINE_RE = re.compile(r"\\\([\s\S]*?\\\)|\$[^$\n]*?\$")
 # \newcommand{\x}[2][default]{...}: the optional args sit between the two
@@ -265,6 +272,30 @@ def read_text(path):
         return fh.read()
 
 
+def keep_theorem_notes(s, preamble):
+    r"""\begin{lemma}[branches] -- the bracket is the environment's printed
+    name, so it is prose, unlike \begin{figure}[htbp] or an enumitem option
+    list. BEGIN_END_RE takes the bracket with the \begin, which made every
+    theorem note read as an invention on the markdown side."""
+    envs = set(paper2md.Preamble(preamble).theorems) | {"proof"}
+    if not envs:
+        return s
+    pat = re.compile(r"\\begin\s*\{(%s)\*?\}\s*(?=\[)"
+                     % "|".join(re.escape(e) for e in sorted(envs)))
+    out, i = [], 0
+    for m in pat.finditer(s):
+        if m.start() < i:
+            continue
+        note, after = paper2md.balanced(s, m.end(), "[", "]")
+        if note is None:
+            continue
+        out.append(s[i:m.start()])
+        out.append(" " + note + " ")
+        i = after
+    out.append(s[i:])
+    return "".join(out)
+
+
 def source_text_tex(path, skip_refs=True):
     s = read_text(path)
     if paper2md is None:                              # pragma: no cover
@@ -291,12 +322,14 @@ def source_text_tex(path, skip_refs=True):
         s = s[:m.start()] + " " + s[after:]
 
     s = paper2md.replace_envs(s, DROP_ENVS, lambda node, body, anc: " ")
+    s = TEX_LINEBREAK_RE.sub(" ", s)
     s = TEX_DISPLAY_RE.sub(" ", s)
     s = TEX_INLINE_RE.sub(" ", s)
     for name, nargs in KEY_COMMANDS:
         s = paper2md.drop_cmd_arg(s, name, nargs)
 
     s = paper2md.decode_accents(s)
+    s = keep_theorem_notes(s, preamble)
     s = BEGIN_END_RE.sub(" ", s)
     s = CMD_RE.sub(" ", s)
     s = re.sub(r"[{}~^_&]", " ", s)

@@ -136,11 +136,29 @@ def balanced(s, i, open_ch="{", close_ch="}"):
 
 
 def grab_args(s, i, n):
-    """Grab n balanced {..} groups starting at s[i] (skipping whitespace)."""
+    r"""Grab n macro arguments starting at s[i] (skipping whitespace).
+
+    An argument is a balanced {..} group, or -- as in real TeX, where an
+    undelimited argument is simply the next TOKEN -- a single control
+    sequence or a single character. The brace-only reading left \ket\psi
+    and \proj\psi unexpanded (KaTeX then rejects the undefined \proj), and
+    braceless single-token arguments are ordinary style in physics papers.
+    """
     args = []
     for _ in range(n):
         while i < len(s) and s[i] in " \t\n":
             i += 1
+        if i < len(s) and s[i] == "\\":
+            m = re.match(r"\\([A-Za-z]+|.)", s[i:], re.S)
+            if m is None:
+                return None, i
+            args.append(m.group(0))
+            i += m.end()
+            continue
+        if i < len(s) and s[i] not in "{}":
+            args.append(s[i])
+            i += 1
+            continue
         content, ni = balanced(s, i)
         if content is None:
             return None, i
@@ -236,6 +254,176 @@ def env_body(s, node):
     return s[first.pos:last.pos + last.len]
 
 
+_ROMAN = [(1000, "m"), (900, "cm"), (500, "d"), (400, "cd"),
+          (100, "c"), (90, "xc"), (50, "l"), (40, "xl"),
+          (10, "x"), (9, "ix"), (5, "v"), (4, "iv"), (1, "i")]
+
+
+def _roman(n):
+    out = []
+    for v, sym in _ROMAN:
+        while n >= v:
+            out.append(sym); n -= v
+    return "".join(out)
+
+
+_COUNTER_STYLES = {
+    "alph":   lambda n: chr(96 + n) if 1 <= n <= 26 else str(n),
+    "Alph":   lambda n: chr(64 + n) if 1 <= n <= 26 else str(n),
+    "roman":  _roman,
+    "Roman":  lambda n: _roman(n).upper(),
+    "arabic": str,
+}
+_COUNTER_RE = re.compile(r"\\(alph|Alph|roman|Roman|arabic)\*")
+
+
+def _enum_label_fn(opt):
+    r"""n -> the printed label, from an enumitem option list.
+
+    label=(\alph*) gives "(a)"; anything without a counter command in it
+    (label=\textbullet, or just "nosep") gives None, i.e. plain numbering.
+    """
+    if not opt:
+        return None
+    m = re.search(r"label\s*=\s*(\{[^{}]*\}|[^,\]]*)", opt)
+    if not m:
+        return None
+    tmpl = m.group(1).strip()
+    if tmpl.startswith("{") and tmpl.endswith("}"):
+        tmpl = tmpl[1:-1]
+    cm = _COUNTER_RE.search(tmpl)
+    if not cm:
+        return None
+    style = _COUNTER_STYLES[cm.group(1)]
+    head, tail = tmpl[:cm.start()], tmpl[cm.end():]
+    return lambda n: (head + style(n) + tail).strip()
+
+
+def _split_items(body):
+    r"""[(optional \item[tag], text)] for one list body. Splits only on an
+    \item at brace level zero, so an \item inside a nested group (a table
+    cell, a stashed placeholder's argument) does not start a new entry."""
+    items, depth, i, starts = [], 0, 0, []
+    while i < len(body):
+        c = body[i]
+        if c == "\\":
+            if body.startswith(r"\item", i) and not body[i + 5:i + 6].isalpha():
+                if depth == 0:
+                    starts.append(i)
+                i += 5
+            else:                       # \itemsep and every other command
+                i += 2
+            continue
+        if c == "{":
+            depth += 1
+        elif c == "}":
+            depth -= 1
+        i += 1
+    for k, st in enumerate(starts):
+        end = starts[k + 1] if k + 1 < len(starts) else len(body)
+        rest = body[st + 5:end]
+        tag = None
+        m = re.match(r"\s*\[", rest)
+        if m:
+            tag, after = balanced(rest, m.end() - 1, "[", "]")
+            if tag is not None:
+                rest = rest[after:]
+        items.append((tag, rest))
+    return items
+
+
+def _indent_continuations(text, pad):
+    """Keep a wrapped item's own lines under its bullet, so a nested list or
+    a second paragraph stays part of the item instead of ending it."""
+    lines = text.split("\n")
+    return "\n".join([lines[0]] + [(pad + ln if ln.strip() else ln)
+                                   for ln in lines[1:]])
+
+
+_QUOTE_PREFIX = re.compile(r"^(?:>\s?)+")
+
+# One stashed block. NUL-delimited so it cannot collide with anything in a
+# paper, and matchable so restore() can find the placeholders in a line
+# instead of testing the whole store against it.
+PLACEHOLDER = "\x00PM%d\x00"
+PLACEHOLDER_RE = re.compile("\x00PM\\d+\x00")
+
+
+def blockquote(body):
+    """Markdown blockquote of a block of text: every line carries the
+    marker, blank lines included, and a run of blank ones collapses (an
+    environment that opened with \\leavevmode or a list leaves several)."""
+    out = []
+    for ln in body.split("\n"):
+        q = ("> " + ln).rstrip() if ln.strip() else ">"
+        if q == ">" and out[-1:] == [">"]:
+            continue
+        out.append(q)
+    while out and out[-1] == ">":
+        out.pop()
+    return "\n".join(out)
+
+
+def typographic_quotes(s):
+    """``like this'' is TeX's spelling. Left alone, the opening `` is
+    Markdown's INLINE CODE delimiter and swallows the rest of the sentence
+    into a code span."""
+    return s.replace("``", "\u201c").replace("''", "\u201d")
+
+
+# A code span (from \texttt) or a link target is verbatim: "--" inside one is
+# a command-line flag or part of a URL, not an en dash.
+_VERBATIM_SPAN = re.compile(r"`[^`\n]*`|\]\([^()\s]*\)")
+
+
+def dashes(s):
+    """TeX's --- and -- for the dashes they print."""
+    def one(chunk):
+        return chunk.replace("---", "—").replace("--", "–")
+    out, i = [], 0
+    for m in _VERBATIM_SPAN.finditer(s):
+        out.append(one(s[i:m.start()]))
+        out.append(m.group(0))
+        i = m.end()
+    out.append(one(s[i:]))
+    return "".join(out)
+
+
+# Ordered longest-first so \Large is not matched as \large's prefix by the
+# alternation that strips a bare declaration.
+_SIZE_DECLS = ("normalsize", "footnotesize", "scriptsize", "LARGE", "Large",
+               "large", "Huge", "huge", "small", "tiny")
+
+
+def env_opt_and_body(s, node):
+    r"""(optional argument, body) for one environment node.
+
+    \begin{lemma}[branches] and \begin{proof}[Proof of Theorem 1] carry the
+    only human-written part of the environment's heading in that bracket.
+    pylatexenc parses it into the node's arguments for an environment it
+    does not know, so env_body() -- which spans the CHILD nodes -- leaves it
+    out entirely and it was being dropped in silence; for an environment it
+    does know (enumerate and its enumitem options) it stays at the head of
+    the body instead. Both spellings are handled here so callers see one.
+    """
+    inner = env_body(s, node)
+    m = re.compile(r"\\begin\s*\{%s\}" % re.escape(node.environmentname)).match(s, node.pos)
+    if m is None:
+        return None, inner
+    j = m.end()
+    while j < len(s) and s[j] in " \t\n":
+        j += 1
+    if j >= len(s) or s[j] != "[":
+        return None, inner
+    opt, after = balanced(s, j, "[", "]")
+    if opt is None or after > node.pos + node.len:
+        return None, inner
+    body_start = node.nodelist[0].pos if node.nodelist else node.pos + node.len
+    if after > body_start:                      # the bracket is part of `inner`
+        inner = inner[after - body_start:]
+    return opt, inner
+
+
 def env_spans(s, names):
     """[(node, ancestor_env_names)] for every environment in `names`, in
     DOCUMENT ORDER, outermost first. A match is not descended into, so the
@@ -261,14 +449,23 @@ def env_spans(s, names):
     return found
 
 
-def replace_envs(s, names, fn):
-    """Rewrite every environment in `names` via fn(node, body, ancestors)."""
+def replace_envs(s, names, fn, with_opt=False):
+    """Rewrite every environment in `names` via fn(node, body, ancestors).
+
+    With with_opt, fn is called as fn(node, opt, body, ancestors) instead,
+    `opt` being the environment's [optional argument] (see env_opt_and_body)
+    and `body` the environment body with that bracket removed.
+    """
     out, i = [], 0
     for node, anc in env_spans(s, names):
         if node.pos < i:                      # defensive: never go backwards
             continue
         out.append(s[i:node.pos])
-        out.append(fn(node, env_body(s, node), anc))
+        if with_opt:
+            opt, inner = env_opt_and_body(s, node)
+            out.append(fn(node, opt, inner, anc))
+        else:
+            out.append(fn(node, env_body(s, node), anc))
         i = node.pos + node.len
     out.append(s[i:])
     return "".join(out)
@@ -471,6 +668,24 @@ _FM_RE = re.compile(r"\\(%s)(?![A-Za-z])\s*\*?\s*(?:\[([^\]]*)\])?\s*(?=\{)"
 _FM_NESTED = ("thanks", "footnote", "footnotemark", "altaffilmark",
               "email", "homepage")
 
+_TITLE_SUBTITLE_RE = re.compile(
+    r"\{\s*\\(?:%s)(?![A-Za-z])\s*(.*)\}\s*$" % "|".join(_SIZE_DECLS), re.S)
+
+
+def split_subtitle(title):
+    r"""(title, subtitle or None).
+
+    A trailing size-declared group -- \title{Main\\[1ex] {\large A subtitle}}
+    -- is the standard way to set a subtitle in a class that has no
+    \subtitle. Run into the heading it reads as one run-on sentence, and
+    left alone the braces and \large survive as literal text.
+    """
+    m = _TITLE_SUBTITLE_RE.search(title)
+    if not m:
+        return title, None
+    return title[:m.start()].strip(), m.group(1).strip()
+
+
 def tidy_frontmatter(val, sep=" "):
     r"""Text-level cleanup for one \title/\author/\affiliation value.
 
@@ -564,8 +779,11 @@ class Frontmatter:
                 self.emails.append((named or "", val))
             elif cmd == "date":
                 # \date{\today} says nothing at conversion time; a literal
-                # date is what the PDF prints.
-                if "\\" not in val:
+                # date is what the PDF prints -- and it still prints when it
+                # carries markup, so testing for a bare backslash threw away
+                # a whole \date{... \texttt{notes/x.md} (September 2026)}
+                # line without so much as a flag.
+                if not re.fullmatch(r"(?:\\(?:today|date)(?![A-Za-z])\s*)*", val.strip()):
                     self.date = val
             else:                          # pacs / keywords / thanks / preprint
                 flag("frontmatter-dropped",
@@ -649,6 +867,14 @@ BUILTIN_MACROS = {
     r"\proof": (0, r"\begin{proof}"),
     r"\endproof": (0, r"\end{proof}"),
 }
+
+# Macros that genuinely take an optional argument, so a following "[...]"
+# belongs to the macro rather than to the author's own text.
+OPTIONAL_ARG_MACROS = {r"\smashoperator"}
+
+# Does the text end with a control word, i.e. would a letter appended to it
+# fuse into a longer (and undefined) command name?
+_CTRL_WORD_END = re.compile(r"\\[A-Za-z]+$")
 
 class Preamble:
     def __init__(self, text):
@@ -823,13 +1049,24 @@ def expand_macros(body, macros, max_passes=12):
             # TeX discards whitespace after a control word, so the source's own
             # space is NOT preserved here -- reproducing that is what keeps
             # "\sel (\D)" rendering as "\mathtt{sel}(\D)" the way LaTeX does.
-            # \smashoperator[r]{...} — drop a bracket option if present
             while j < len(body) and body[j] in " \t":
                 j += 1
-            if j < len(body) and body[j] == "[":
+            # \smashoperator[r]{...} really does take an optional argument.
+            # Almost nothing else does, and eating a "[" the author wrote
+            # deletes an operand in total silence: \DeclareMathOperator's \Tr
+            # used as \Tr[\rho] came out as \operatorname{Tr} with the [\rho]
+            # gone -- valid LaTeX, valid KaTeX, wrong mathematics, and
+            # invisible to every check downstream.
+            if name in OPTIONAL_ARG_MACROS and j < len(body) and body[j] == "[":
                 _, j = balanced(body, j, "[", "]")
+            # The mirror image of the trailing-space rule below: a space is
+            # needed on the LEFT wherever the expansion would weld itself onto
+            # the control word in front of it. "\le\Neg(x)" with \Neg -> "N"
+            # is two tokens to TeX but reads as the undefined "\leN" as text.
+            lead = " " if (tmpl[:1].isalpha()
+                           and _CTRL_WORD_END.search(body[max(0, i - 40):i])) else ""
             if nargs == 0:
-                repl = tmpl
+                repl = lead + tmpl
                 out.append(repl)
                 # One space is still needed where dropping it would glue the
                 # expansion onto what follows and merge them into a different
@@ -846,7 +1083,7 @@ def expand_macros(body, macros, max_passes=12):
             args, nj = grab_args(body, j, nargs)
             if args is None:
                 out.append(body[i:i + m.end()]); i += m.end(); continue
-            repl = _substitute_args(tmpl, args)
+            repl = lead + _substitute_args(tmpl, args)
             out.append(repl); i = nj; changed = True
         body = "".join(out)
         if not changed:
@@ -1046,15 +1283,42 @@ def render_bib_body(s):
     \\~ is an author writing a tilde rather than an accent."""
     text = _render_bib_walk(s)
     text = text.replace("``", '"').replace("''", '"')
+    text = dashes(text)
     text = re.sub(r"\s+", " ", text).strip()
     return text
 
+def extract_thebibliography(body):
+    r"""(the environment's contents, the body without it).
+
+    Lifted out before conversion for two reasons: the entries have to be
+    numbered before \cite is rendered, and the environment is not prose --
+    left in the body it leaked as a literal \begin{thebibliography} and
+    every \cite fell back to its raw key.
+    """
+    def rep(_node, inner, _anc):
+        found.append(inner)
+        return "\n\n"
+    found = []
+    rest = replace_envs(body, {"thebibliography"}, rep)
+    if not found:
+        return None, body
+    return "\n".join(found), rest
+
+
 def parse_bbl(path):
     """Return (cite_key -> number, [rendered entries in order])."""
-    order, entries = {}, []
     if not path or not os.path.exists(path):
-        return order, entries
+        return {}, []
     s = open(path, encoding="utf-8", errors="replace").read()
+    return parse_bibitems(s, os.path.basename(path))
+
+
+def parse_bibitems(s, where):
+    """Return (cite_key -> number, [rendered entries in order]) for the
+    \\bibitem entries in `s` -- a .bbl file, or a thebibliography environment
+    written out by hand in the source, which is how a paper with no .bib
+    carries its references and is just as authoritative."""
+    order, entries = {}, []
     # (?![A-Za-z]) so this doesn't also split on \bibitemStop / \bibitemNoStop,
     # which apsrev-style preambles \providecommand before any real \bibitem.
     items = re.split(r"\\bibitem(?![A-Za-z])", s)[1:]
@@ -1068,7 +1332,7 @@ def parse_bbl(path):
                 j += 1
         if j >= len(it) or it[j] != "{":
             flag("bbl-unparsed-entry",
-                 f"\\bibitem #{n} in {os.path.basename(path)}: no citation key found "
+                 f"\\bibitem #{n} in {where}: no citation key found "
                  f"(malformed entry, or an unterminated optional label). Any \\cite "
                  f"of this reference will not resolve, and it will be missing from "
                  f"the reference list.", it[:300])
@@ -1076,7 +1340,7 @@ def parse_bbl(path):
         key, after = balanced(it, j)
         if key is None:
             flag("bbl-unparsed-entry",
-                 f"\\bibitem #{n} in {os.path.basename(path)}: citation key group is "
+                 f"\\bibitem #{n} in {where}: citation key group is "
                  f"unterminated. Any \\cite of this reference will not resolve, and it "
                  f"will be missing from the reference list.", it[:300])
             continue
@@ -1296,7 +1560,7 @@ class Converter:
 
     def stash(self, text):
         self.n += 1
-        key = f"\x00PM{self.n}\x00"
+        key = PLACEHOLDER % self.n
         # a $$ block must sit alone between blank lines or the checker (and most
         # renderers) will not recognise it as display math
         if text.startswith("$$"):
@@ -1305,13 +1569,38 @@ class Converter:
         return key
 
     def restore(self, s):
+        # Found by pattern rather than by trying every key against every
+        # line: a long paper stashes thousands of blocks, and the store also
+        # holds __restate__, whose value is a dict and not text at all.
         for _ in range(6):
-            changed = False
-            for k, v in self.store.items():
-                if k in s:
-                    s = s.replace(k, v); changed = True
-            if not changed:
+            if not PLACEHOLDER_RE.search(s):
                 break
+            lines = []
+            for ln in s.split("\n"):
+                if PLACEHOLDER_RE.search(ln) is None:
+                    lines.append(ln)
+                    continue
+                # A placeholder standing on a quoted line is a display block
+                # (or a fenced figure) inside a theorem: it restores to
+                # several lines, and without the quote marker carried onto
+                # each of them the equation drops OUT of the theorem it
+                # belongs to, both visually and for every structural check.
+                m = _QUOTE_PREFIX.match(ln)
+                pre = m.group(0).rstrip() + " " if m else ""
+
+                def one(hit, pre=pre):
+                    v = self.store.get(hit.group(0))
+                    if v is None:                 # not ours; leave it alone
+                        return hit.group(0)
+                    if pre and "\n" in v:
+                        head, *rest = v.split("\n")
+                        v = "\n".join([head] + [(pre + x).rstrip() if x.strip()
+                                                else pre.rstrip() for x in rest])
+                    return v
+                # A function repl is substituted literally, so the backslashes
+                # a restored block is made of stay as they are.
+                lines.append(PLACEHOLDER_RE.sub(one, ln))
+            s = "\n".join(lines)
         return s
 
     # ---- figures ----
@@ -1772,17 +2061,23 @@ class Converter:
         # Math is already stashed as placeholders by now (design rule 2), so
         # this only ever sees text.
         s = decode_accents(s)
+        s = typographic_quotes(s)
+
+        # Lists and block quotes first: both are LINE-oriented in Markdown,
+        # and a theorem-like environment quotes its body line by line. Doing
+        # them the other way round (as a late regex pass, which is what the
+        # \item -> "- " substitution used to be) emits "- " lines INSIDE an
+        # already-quoted block, so the items of a lemma break out of it.
+        s = self._lists(s)
+        s = self._quotes(s)
 
         # theorem-like environments. Still one environment name at a time, so
         # a lemma inside a proof is converted before the proof wraps it.
         for env, disp in list(self.pre.theorems.items()) + [("proof", "Proof")]:
-            def rep(node, inner, anc, env=env, disp=disp):
-                # \begin{theorem}[Note] — pylatexenc leaves the optional
-                # argument of an unknown environment at the head of the body.
-                note = ""
-                nm = re.match(r"\s*\[([^\]]*)\]", inner)
-                if nm:
-                    note, inner = nm.group(1).strip(), inner[nm.end():]
+            def rep(node, opt, inner, anc, env=env, disp=disp):
+                # \begin{theorem}[Note] — the note is the only part of the
+                # heading the author wrote, so losing it loses content.
+                note = (opt or "").strip()
                 lm = re.search(r"\\label\s*\{([^}]*)\}", inner)
                 num = self.labels.get(lm.group(1), "") if lm else ""
                 if env != "proof":
@@ -1796,12 +2091,13 @@ class Converter:
                         except ValueError: pass
                 inner = re.sub(r"\\label\s*\{[^}]*\}", "", inner).strip()
                 if env == "proof":
-                    return "\n\n*Proof.* %s $\\square$\n\n" % inner
+                    # \begin{proof}[Proof of Theorem 1] -- amsthm prints the
+                    # note INSTEAD of "Proof", and a paper with several
+                    # consecutive proofs is unreadable without it.
+                    return "\n\n*%s.* %s $\\square$\n\n" % (note.rstrip(".") or "Proof", inner)
                 head = f"**{disp} {num}".strip() + (f" ({note})" if note else "") + ".**"
-                quoted = "\n".join("> " + ln if ln.strip() else ">"
-                                   for ln in (head + " " + inner).split("\n"))
-                return "\n\n" + quoted + "\n\n"
-            s = replace_envs(s, {env}, rep)
+                return "\n\n" + blockquote(head + " " + inner) + "\n\n"
+            s = replace_envs(s, {env}, rep, with_opt=True)
 
         # restatable: \begin{restatable}{lemma}{MacroName} body \end{restatable}
         def restate(node, inner, _anc):
@@ -1819,8 +2115,7 @@ class Converter:
             self.store.setdefault("__restate__", {})
             body = f"**{disp} {num}.**".replace(" .", ".") + " " + inner
             RESTATE[macro] = body
-            quoted = "\n".join("> " + ln if ln.strip() else ">" for ln in body.split("\n"))
-            return "\n\n" + quoted + "\n\n"
+            return "\n\n" + blockquote(body) + "\n\n"
         s = replace_envs(s, {"restatable", "restatable*"}, restate)
         # \MacroName*  -> the stored statement
         def unrestate(m):
@@ -1839,6 +2134,11 @@ class Converter:
         s = re.sub(r"\\subsection\*?\s*\{", lambda m: "\n\n### ", s)
         s = re.sub(r"\\subsubsection\*?\s*\{", lambda m: "\n\n#### ", s)
         s = self._close_heading(s)
+        # \paragraph is a run-in heading, not a section: LaTeX sets it bold on
+        # the same line as the text that follows. A heading level would break
+        # verify.py's outline, so it stays a bold lead-in.
+        for cmd in ("paragraph", "subparagraph"):
+            s = self._wrap(s, cmd + r"\*?", "**")
 
         # footnotes
         out, i = [], 0
@@ -1867,12 +2167,16 @@ class Converter:
         for cmd, wrap in [("em", "*"), ("it", "*"), ("sl", "*"), ("bf", "**"),
                           ("tt", "`"), ("sc", ""), ("rm", "")]:
             s = self._wrap_bare_font_group(s, cmd, wrap)
+        # Size declarations carry no meaning Markdown can render, but they are
+        # used the same way -- {\large A subtitle} -- so the group has to be
+        # unwrapped or its braces survive as prose.
+        for cmd in _SIZE_DECLS:
+            s = self._wrap_bare_font_group(s, cmd, "")
 
-        # lists
-        s = re.sub(r"\\begin\{itemize\}", "\n", s)
-        s = re.sub(r"\\end\{itemize\}", "\n", s)
-        s = re.sub(r"\\begin\{enumerate\}", "\n", s)
-        s = re.sub(r"\\end\{enumerate\}", "\n", s)
+        # Any \item left over here is one whose list environment the walker
+        # could not see (a stray \item, or a list opened by a macro).
+        s = re.sub(r"\\begin\{(itemize|enumerate|description)\}", "\n", s)
+        s = re.sub(r"\\end\{(itemize|enumerate|description)\}", "\n", s)
         s = re.sub(r"\\item\s+", "\n- ", s)
 
         # cross-references
@@ -1928,8 +2232,9 @@ class Converter:
         s = re.sub(r"\\(?:label|nocite|bibliographystyle|bibliography|maketitle|centering"
                    r"|setlength|setcounter|addtolength|counterwithin|renewcommand"
                    r"|vspace|hspace|bigskip|medskip|smallskip|noindent|onecolumn|twocolumn"
-                   r"|onecolumngrid|twocolumngrid|allowdisplaybreaks"
-                   r"|appendix|FloatBarrier|center|par)\b\s*(\[[^\]]*\])?", "", s)
+                   r"|onecolumngrid|twocolumngrid|allowdisplaybreaks|leavevmode"
+                   r"|clearpage|cleardoublepage|newpage|sloppy|" + "|".join(_SIZE_DECLS) +
+                   r"|appendix|FloatBarrier|center|par)\b[ \t]*(\[[^\]]*\])?", "", s)
         s = re.sub(r"\\begin\{(document|strip|abstract|center|subfigure)\}", "", s)
         s = re.sub(r"\\end\{(document|strip|abstract|center|subfigure)\}", "", s)
         if self.args.drop_color:
@@ -1944,7 +2249,8 @@ class Converter:
         s = re.sub(r"^[ \t]*[{}][ \t]*$", "", s, flags=re.M)
         s = re.sub(r"\\ ", " ", s)          # control-space after a macro
         s = re.sub(r"\\([&%#_{}])", r"\1", s)  # escaped special characters
-        s = s.replace("---", "—").replace("~", " ")
+        s = dashes(s)
+        s = s.replace("~", " ")
         s = re.sub(r"\n{3,}", "\n\n", s)
         return s
 
@@ -1967,6 +2273,52 @@ class Converter:
             out.append(s[j:k - 1])
             i = k
         return "".join(out)
+
+    def _lists(self, s):
+        r"""itemize/enumerate/description -> Markdown lists.
+
+        Nesting-aware (the body of a list is converted before its own items
+        are split out), and enumitem-aware: \begin{enumerate}[label=(\alph*)]
+        prints "(a)", "(b)", ... and the prose then cites "Lemma 2.5(a)", so
+        a plain "1." list loses the labels the cross-references depend on.
+        The option itself is consumed either way -- left alone it surfaced as
+        a literal "[label=(\alph*),nosep]" line of prose.
+        """
+        def rep(node, opt, inner, _anc):
+            env = node.environmentname
+            inner = self._lists(inner)            # innermost lists first
+            items = _split_items(inner)
+            if not items:
+                return "\n\n" + inner.strip() + "\n\n"
+            label = _enum_label_fn(opt) if env == "enumerate" else None
+            out = []
+            for n, (tag, text) in enumerate(items, 1):
+                if env == "description":
+                    bullet = "- " + (f"**{tag.strip()}** " if tag else "")
+                elif tag:                         # \item[3.] overrides
+                    bullet = f"- {tag.strip()} "
+                elif env == "enumerate":
+                    bullet = f"- {label(n)} " if label else f"{n}. "
+                else:
+                    bullet = "- "
+                # Two spaces, not the bullet's own width: four or more would
+                # make a continuation paragraph an indented CODE BLOCK, and
+                # a label like "- (iii) " is eight characters wide.
+                body = _indent_continuations(text.strip(), "  ")
+                out.append(bullet + body)
+            return "\n\n" + "\n\n".join(out) + "\n\n"
+        return replace_envs(s, {"itemize", "enumerate", "description"},
+                            rep, with_opt=True)
+
+    def _quotes(self, s):
+        r"""quote/quotation -> a Markdown blockquote, rather than a leaked
+        \begin{quote} and an unquoted paragraph."""
+        def rep(_node, inner, _anc):
+            body = inner.strip()
+            if not body:
+                return "\n\n"
+            return "\n\n" + blockquote(body) + "\n\n"
+        return replace_envs(s, {"quote", "quotation"}, rep)
 
     def _wrap(self, s, cmd, wrap):
         out, i = [], 0
@@ -2033,7 +2385,11 @@ class Converter:
             for r in rows:
                 r = re.sub(r"\\hline|\\toprule|\\midrule|\\bottomrule", "", r).strip()
                 if not r: continue
-                grid.append([c.strip() for c in r.split("&")])
+                # Cell text is stashed before the document-wide typographic
+                # pass runs, so a cell's own --- or ``...'' has to be done
+                # here or it survives as the TeX spelling.
+                grid.append([dashes(typographic_quotes(c.strip()))
+                             for c in r.split("&")])
             if not grid: return ""
             w = max(len(r) for r in grid)
             grid = [r + [""] * (w - len(r)) for r in grid]
@@ -2092,6 +2448,12 @@ def run_checks(md):
         # can never trigger Markdown's emphasis parsing the way a bare "_"
         # in prose would.
         stripped = re.sub(r"\]\([^()\s]*\)", "]()", stripped)
+        # A code span is verbatim: the "_" in `teleport_capacity.py` is part
+        # of a filename Markdown will not read as emphasis, exactly as inside
+        # a fence. \texttt{} is how it got there, so this is common. A span
+        # containing a BACKSLASH is not exempt: a `notes/x\_1.md` that kept
+        # its LaTeX escape prints the backslash, which is still a defect.
+        stripped = re.sub(r"`[^`\n\\]*`", "", stripped)
         # An autolinked address, e.g. the <first_last@example.edu> of an
         # \email in the frontmatter, is a target too and never rendered text.
         stripped = re.sub(r"<[^<>\s]+>", "", stripped)
@@ -2153,11 +2515,23 @@ def main():
     if not aux:
         flag("no-aux", "No .aux file: cross-references cannot be numbered. "
                        "Compile the paper and re-run with --aux.")
-    if not bbl:
-        flag("no-bbl", "No .bbl file: citations cannot be numbered and no reference "
-                       "list will be emitted. Run bibtex and re-run with --bbl.")
     labels = parse_aux(aux)
-    cite_order, bib_entries = parse_bbl(bbl)
+    # A hand-written \begin{thebibliography} in the source IS the bibliography
+    # -- there is no .bib to run bibtex over and no .bbl will ever exist -- so
+    # it is read straight out of the body, and preferred over any .bbl lying
+    # around, which in that case belongs to something else.
+    inline_bib, body = extract_thebibliography(body)
+    if inline_bib is not None:
+        cite_order, bib_entries = parse_bibitems(inline_bib, "the source")
+        if bbl:
+            flag("bib-source-conflict",
+                 f"the source carries its own \\begin{{thebibliography}} AND "
+                 f"{os.path.basename(bbl)} exists; the source's was used.", "")
+    else:
+        if not bbl:
+            flag("no-bbl", "No .bbl file: citations cannot be numbered and no reference "
+                           "list will be emitted. Run bibtex and re-run with --bbl.")
+        cite_order, bib_entries = parse_bbl(bbl)
 
     for st in pre.tikz_styles:
         if st not in a.style_map:
@@ -2223,9 +2597,16 @@ def main():
                           ("texttt", "`"), ("textsc", ""), ("textrm", ""),
                           ("mbox", "")]:
             v = conv._wrap(v, cmd, wrap)
+        # ...including the unescaping do_text() does: a \_ left in place
+        # prints its backslash, and a \date or \title carrying a filename is
+        # exactly where one turns up.
+        v = re.sub(r"\\([&%#_{}$])", r"\1", v)
         return decode_accents(v)
     if pre.title:
-        head.append("# " + frontmatter_text(pre.title))
+        title, subtitle = split_subtitle(pre.title)
+        head.append("# " + frontmatter_text(title))
+        if subtitle:
+            head.append("*" + frontmatter_text(subtitle) + "*")
     else:
         flag("no-title", "No \\title found in the preamble or before \\maketitle.")
     if pre.authors:
@@ -2249,6 +2630,10 @@ def main():
         md += "\n\n## References\n\n" + "\n\n".join(f"[{n}] {t}" for n, t in bib_entries) + "\n"
 
     md = re.sub(r"\n{3,}", "\n\n", md)
+    # Trailing blanks are a hard line break in Markdown, and a blockquote
+    # whose placeholders restored after it was built collects them.
+    md = re.sub(r"[ \t]+$", "", md, flags=re.M)
+    md = re.sub(r"(?:^>\n){2,}", ">\n", md, flags=re.M)
     out = a.out or (stem + ".md")
     open(out, "w", encoding="utf-8").write(md)
 

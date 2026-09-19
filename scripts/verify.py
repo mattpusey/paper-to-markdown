@@ -185,6 +185,13 @@ FIG_CAP_RE = re.compile(r"\*\*Figure\s+([\w.]+?):", re.I)
 TAB_CAP_RE = re.compile(r"\*\*Table\s+([\w.]+?):", re.I)
 FIG_REF_RE = re.compile(r"\bFig(?:ure)?s?\.?\s*(\d[\w.]*)", re.I)
 TAB_REF_RE = re.compile(r"\bTables?\s*(\d[\w.]*)", re.I)
+# "Table 1 of [3]", "Fig. 2 of Ref. [3]", "Table 1 of Schmid and Rosset [3]"
+# name a float in a CITED paper, which this document is under no obligation
+# to carry a caption for. Only a citation-shaped run may sit between the
+# "of" and the bracket -- author surnames, "et al.", "Ref." -- so an ordinary
+# "Table 2 in the appendix [4]" is still checked.
+_ELSEWHERE_RE = re.compile(
+    r"\s*(?:of|in)\s+(?:(?:Refs?\.|et\s+al\.|and|&|,|[A-Z][\w'’-]*)\s*)*\[")
 
 
 def _norm_float(tok):
@@ -220,10 +227,12 @@ def check_floats(md):
     tabs = [_norm_float(n) for n in TAB_CAP_RE.findall(md)]
     blocks = count_figure_blocks(md)
 
-    missing_f = sorted({_norm_float(n) for n in FIG_REF_RE.findall(body)
-                        if not _resolves(n, set(figs))})
-    missing_t = sorted({_norm_float(n) for n in TAB_REF_RE.findall(body)
-                        if not _resolves(n, set(tabs))})
+    missing_f = sorted({_norm_float(m.group(1)) for m in FIG_REF_RE.finditer(body)
+                        if not _resolves(m.group(1), set(figs))
+                        and not _ELSEWHERE_RE.match(body, m.end())})
+    missing_t = sorted({_norm_float(m.group(1)) for m in TAB_REF_RE.finditer(body)
+                        if not _resolves(m.group(1), set(tabs))
+                        and not _ELSEWHERE_RE.match(body, m.end())})
     ok = not missing_f and not missing_t
 
     return ({"status": "OK" if ok else "FAIL",
