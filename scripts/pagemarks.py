@@ -221,7 +221,7 @@ def page_candidates(text):
                 key = (c[0], c[1])
                 found[key] = max(found.get(key, (0, ""))[0], 3), c[2]
                 continue
-        if len(line) > 120:
+        if len(" ".join(line.split())) > 120:          # padding is not text
             continue
         toks = line.split()
         for tok in {toks[0], toks[-1]}:
@@ -315,6 +315,12 @@ _PROTECT = [verify.FENCE_RE,
             srcdiff.HTML_TAG_RE,
             srcdiff.FOOTNOTE_RE]
 _LETTERS_RE = re.compile(r"[^\W\d_]+")
+# Words of two letters or more, as in srcdiff. A PDF text layer spells
+# $x_5$ as a stray "x", and one-letter tokens let that debris break the very
+# trigrams that anchor a page boundary; a page opening on a real one-letter
+# word ("a particular state") is handled after placement instead.
+_WORD_RE = srcdiff.WORD_RE
+_ANY_WORD_RE = re.compile(r"[a-z]+")
 
 
 def mask_markdown(md):
@@ -330,7 +336,7 @@ def mask_markdown(md):
 def markdown_words(masked):
     words, starts, ends = [], [], []
     for m in _LETTERS_RE.finditer(masked):
-        for w in srcdiff.WORD_RE.findall(srcdiff.fold(m.group(0))):
+        for w in _WORD_RE.findall(srcdiff.fold(m.group(0))):
             words.append(w)
             starts.append(m.start())
             ends.append(m.end())
@@ -426,7 +432,8 @@ def drop_label_lines(text, label):
     keep = []
     for k, line in enumerate(lines):
         toks = line.split()
-        if k in edge and toks and label in (toks[0], toks[-1]) and len(line) <= 120:
+        if k in edge and toks and label in (toks[0], toks[-1]) \
+                and len(" ".join(toks)) <= 120:
             continue
         keep.append(line)
     return "\n".join(keep)
@@ -491,6 +498,46 @@ def rejoin_across_pages(pages):
     return pages
 
 
+_ONE_LETTER_BEFORE_RE = re.compile(r"(?<![\w\x00])([A-Za-z])[ \t]+$")
+
+
+def _one_letter_back(md, masked, off, before, after):
+    """Move a marker back over a one-letter word ("a", "I") that the page
+    really opens with: "tight for a <!-- page 2 --> particular" becomes
+    "tight for <!-- page 2 --> a particular" when page 2 has "a particular"
+    without the "for" in front of it, and page 1 does not end on "a". (Not
+    "page 2 starts with": in reading order it may start with the other
+    column.)"""
+    base = max(0, off - 4)
+    m = _ONE_LETTER_BEFORE_RE.search(masked[base:off])
+    nxt = _ANY_WORD_RE.match(srcdiff.fold(masked[off:off + 40]))
+    prv = re.search(r"([a-z]+)[^a-z]*$",
+                    srcdiff.fold(masked[max(0, off - 60):base + m.start(1)])) if m else None
+    if not m or not nxt:
+        return off
+    letter, word = m.group(1).lower(), nxt.group(0)
+    page = re.sub(r"\s+", " ", srcdiff.fold(after))
+    there = re.search(r"\b%s %s\b" % (letter, word), page)
+    glued = prv and re.search(r"\b%s %s %s\b" % (prv.group(1), letter, word), page)
+    ends = re.search(r"\b%s\s*$" % letter, srcdiff.fold(before.rstrip()))
+    return base + m.start(1) if there and not glued and not ends else off
+
+
+_TEX_CMD_RE = re.compile(r"\\[A-Za-z]+")
+
+
+def _gap_tokens(text):
+    """Words in a stretch of Markdown, math included, spelled the way a PDF
+    text layer spells them: \\mbox{Frame 1} gives "frame", a_i gives "ai"."""
+    text = srcdiff.HTML_COMMENT_RE.sub(" ", text)
+    text = re.sub(r"[_^{}]", "", _TEX_CMD_RE.sub(" ", text))
+    return _ANY_WORD_RE.findall(srcdiff.fold(text))
+
+
+def _gap_bag(words):
+    return collections.Counter(w for w in words if len(w) >= 2)
+
+
 def place(md, flow_pages, labels):
     """[(offset, how) or None] for each PDF page, in page order."""
     masked = mask_markdown(md)
@@ -503,12 +550,13 @@ def place(md, flow_pages, labels):
     stripped = rejoin_across_pages(srcdiff.strip_running_lines(stripped))
     for p, text in enumerate(stripped):
         page_lo.append(len(src))
-        toks = srcdiff.tokens(srcdiff.dehyphenate(text))
+        toks = _WORD_RE.findall(srcdiff.fold(srcdiff.dehyphenate(text)))
         src.extend(toks)
         src_page.extend([p] * len(toks))
     page_lo.append(len(src))
 
     placed = align(src, src_page, mwords)
+    placed_src = {i for _, i in placed.values()}
     first_j, last_j, first_i, last_i = {}, {}, {}, {}
     for j in sorted(placed):
         p, i = placed[j]
@@ -537,16 +585,28 @@ def place(md, flow_pages, labels):
         # Between the last word placed on the page before and the first word
         # placed on this one there is usually an equation or a float, and
         # the boundary can be on either side of it. The PDF says which: the
-        # page holding it has unmatched text where it sits.
-        t1 = page_lo[prev + 1] - 1 - last_i[prev]     # unmatched tail, page before
-        t2 = first_i[p] - page_lo[p]                  # unmatched head, this page
+        # page holding it has unmatched text where it sits -- the equation's
+        # letters, a caption -- and the Markdown has the same letters on one
+        # side of the right split and not the other.
+        tail = [src[i] for i in range(last_i[prev] + 1, page_lo[prev + 1])
+                if i not in placed_src]
+        head = [src[i] for i in range(page_lo[p], first_i[p])
+                if i not in placed_src]
+        t1, t2 = len(tail), len(head)
         frac = t1 / (t1 + t2) if t1 + t2 else 1.0
         target = lo + frac * (hi - lo)
 
         cands = [b for b in blocks if lo < b <= hi]
         for j in range(j_l + 1, j_f + 1):
             cands.append(first_in_block(j) or mstarts[j])
-        offsets[p] = min(cands, key=lambda c: (abs(c - target), c not in blocks))
+        tail_c, head_c = _gap_bag(tail), _gap_bag(head)
+
+        def score(c):
+            agree = (sum((_gap_bag(_gap_tokens(md[lo:c])) & tail_c).values())
+                     + sum((_gap_bag(_gap_tokens(md[c:hi])) & head_c).values()))
+            return (-agree, abs(c - target), c not in blocks)
+        offsets[p] = _one_letter_back(md, masked, min(set(cands), key=score),
+                                      stripped[prev], stripped[p])
         prev = p
 
     # A page with no text matched (all figure, blank) goes where the next

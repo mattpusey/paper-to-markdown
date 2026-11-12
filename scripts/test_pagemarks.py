@@ -67,6 +67,18 @@ class Labels(unittest.TestCase):
         labels, _ = pagemarks.detect_labels(pages)
         self.assertEqual(labels, ["i", "ii", "iii", "1", "2", "3"])
 
+    def test_padded_footer_still_counts(self):
+        """pdftotext -layout pads a footer out to the right margin. Measured
+        with its padding, the Quantum journal's footer ("Accepted in Quantum
+        2022-10-17, click title to verify. Published under CC-BY 4.0.    9")
+        ran past the length limit on one page in seventeen, and that page's
+        number was only inferred."""
+        foot = ("Accepted in Quantum 2022-10-17, click title to verify. "
+                "Published under CC-BY 4.0." + " " * 80 + "{}")
+        pages = [page(BODY, foot=foot.format(i + 1)) for i in range(4)]
+        _, how = pagemarks.detect_labels(pages)
+        self.assertEqual(how, ["printed"] * 4)
+
     def test_prefixed_numbers(self):
         pages = [page(BODY, head=f"012345-{i + 1}   SMITH AND JONES")
                  for i in range(3)]
@@ -143,7 +155,15 @@ def unique_words(n, seed):
     rnd = random.Random(seed)
     stock = ("state channel outcome observer system hidden variable source "
              "detector setting graph node edge parent latent proof bound").split()
-    return [f"w{seed}x{i}" if i % 3 == 0 else rnd.choice(stock) for i in range(n)]
+    def tag(k):                       # letters only, or it is no token
+        out = ""
+        while True:
+            out = "bcdfghjklmnpqrstvwxz"[k % 20] + out
+            k //= 20
+            if not k:
+                return "zq" + out
+    return [tag(seed * 10000 + i) if i % 3 == 0 else rnd.choice(stock)
+            for i in range(n)]
 
 
 class Placement(unittest.TestCase):
@@ -201,6 +221,37 @@ class Placement(unittest.TestCase):
         self.assertTrue(pages[0].rstrip().endswith("zydase"))
 
 
+    def test_one_letter_word_opening_a_page(self):
+        """Pusey & Rudolph, arXiv:1208.2550, p. 2 opens "a particular rho and
+        sigma". One-letter words were not tokens, so the marker went after
+        the "a"."""
+        a, b = unique_words(60, 7), unique_words(60, 8)
+        md = " ".join(a) + " tight for a particular $\\rho$ " + " ".join(b) + "\n"
+        # ...and in reading order that page starts with its other column
+        flow = [" ".join(a) + " tight for",
+                " ".join(b[30:]) + "\na particular P ρ " + " ".join(b[:30])]
+        out = pagemarks.insert(md, pagemarks.place(md, flow, ["1", "2"]),
+                               ["1", "2"])
+        self.assertIn("tight for <!-- page 2 --> a particular", out)
+
+    def test_display_at_foot_with_debris_on_both_sides(self):
+        """Caro Perez et al., arXiv:2110.08293, pp. 4-5: an array labelled
+        "<- Frame 1..4" ends page 4 and "Clearly, {a_i, b_i, c_i, d_i}" opens
+        page 5. Both sides leave unmatched letters in the PDF, and counting
+        them put the marker before the array. What the letters ARE decides
+        it: "frame" is in the array, "ai bi" in the sentence after it."""
+        a, b = unique_words(60, 10), unique_words(60, 11)
+        md = (" ".join(a) + " as follows:\n\n$$\n\\begin{array}{cc}\n"
+              "a_1&\\mbox{$\\leftarrow$ Frame 1}\\\\\n"
+              "b_1&\\mbox{$\\leftarrow$ Frame 2}\n\\end{array}\n$$\n\n"
+              "Clearly, $\\{a_i,b_i,c_i,d_i\\}$, is " + " ".join(b) + "\n")
+        flow = [" ".join(a) + " as follows:\na1\nb1\nFrame 1\nFrame 2",
+                "Clearly,\n{ai , bi , ci , di }, is " + " ".join(b)]
+        out = pagemarks.insert(md, pagemarks.place(md, flow, ["4", "5"]),
+                               ["4", "5"])
+        self.assertIn("$$\n\n<!-- page 5 -->\n\nClearly", out)
+
+
 @unittest.skipUnless(shutil.which("pdflatex") and shutil.which("pdftotext"),
                      "needs pdflatex and pdftotext")
 class EndToEnd(unittest.TestCase):
@@ -240,7 +291,7 @@ class EndToEnd(unittest.TestCase):
         # the first unique word after each marker is printed on that page
         _, flow = pagemarks.read_pdf(os.path.join(tmp, "paper.pdf"))
         for k, m in enumerate(pagemarks.MARKER_RE.finditer(md)):
-            after = re.search(r"w9x\d+", md[m.end():]).group(0)
+            after = re.search(r"zq[a-z]+", md[m.end():]).group(0)
             self.assertIn(after, flow[k], f"page {m.group(1)}")
         shutil.rmtree(tmp)
 
