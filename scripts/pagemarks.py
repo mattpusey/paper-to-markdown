@@ -54,6 +54,45 @@ in the same form.
 Needs pdftotext (poppler-utils) or pypdf. paper2md.py calls this itself when it
 finds the compiled PDF next to the .tex.
 
+Not done yet: TeX's own reading order, from SyncTeX
+---------------------------------------------------
+Most of the remaining misplacements come from pdftotext, not from the
+alignment: its reading order sometimes runs a page's right-hand column before
+the left (around a float), or mixes the last lines of two columns mid-word.
+When the paper is compiled from source, TeX knows the real order, and
+`pdflatex -synctex=1` writes it down. paper.synctex.gz holds, for every page,
+one record per typeset line, in TeX's own order (left column before right).
+Each record carries the source file and line, and the box's position and size.
+
+The idea: get the words with their coordinates (pdftotext -bbox-layout), put
+each word into the SyncTeX line box that contains it, and rebuild each page's
+text in record order. Pass that text to place() in place of pdftotext's flow
+text. Nothing else changes, and paper2md.py is not touched. This fixes the
+column order at its source. It also makes the "which side of this display
+is the page break" decision more reliable, because the equation's leftover
+words then sit at the true end of one page or start of the next. SyncTeX is
+decisive on that question by itself: on arXiv:2110.08293 pp. 4-5 the
+\\end{equation*} at source line 120 is recorded only on page 4, and line 121
+("Clearly, ...") is the first line recorded only on page 5.
+
+What SyncTeX cannot replace is the alignment itself. It knows source lines,
+not words, and a source line is often a whole paragraph: on arXiv:1208.2550
+both page breaks fall inside one source line (lines 57 and 91). The Markdown
+also carries no source lines, because conversion inlines \\input, expands
+macros and moves floats. So this would only improve the input to the
+alignment, and only for papers converted from .tex. PDF-only conversions keep
+using pdftotext.
+
+Things to handle if built: records that belong to running heads and feet (on
+arXiv:2110.08293, \\begin{document}'s line turns up on every page), and floats
+(their records sit where the float was typeset, not in the text flow); the
+coordinate conversion between SyncTeX (scaled points, with an offset) and
+pdftotext (PDF points); and falling back to pdftotext's order whenever there
+is no .synctex.gz, or it is older than the PDF. Rough cost: a day, plus
+testing on two-column papers with floats and with displays at page breaks.
+Revisit if real papers turn up misplaced markers of that kind. On the two
+arXiv papers above, all 20 markers are already exact.
+
 Usage
 -----
     pagemarks.py paper.md --pdf paper.pdf           # rewrites paper.md
