@@ -29,13 +29,14 @@ command -v paper2md.py || ls ./paper2md.py ../paper2md.py 2>/dev/null \
 
 Entry point is `paper2md.py`. It needs **pylatexenc** (`pip install pylatexenc`, 2.11 is fine) — the project's only runtime dependency, used for LaTeX structure scanning (nesting-aware `\begin`/`\end` matching, brace matching, comment stripping) and for turning accent constructs into Unicode. Nothing else is needed to convert; verification additionally wants `npm install katex` (step 5) and Node on `PATH`.
 
-Two more scripts sit alongside it, each needed only on the path that uses it:
+More scripts sit alongside it, each needed only on the path that uses it:
 
 | Script | For | Needs |
 |---|---|---|
 | `verify.py` | every conversion (step 5) | `katex` + Node |
 | `srcdiff.py` | comparing the output against the source (step 5) | `pdftotext` **or** `pypdf` for a PDF; `pypdfium2` + `tesseract` for a scan |
 | `pdfpages.py` | deciding what kind of PDF you have, and reading a scan (step 2) | `pypdfium2` |
+| `pagemarks.py` | page markers carrying the paper's printed page numbers (step 3); `paper2md.py` calls it itself | `pdftotext` **or** `pypdf` |
 
 A `.tex` conversion needs none of the PDF-side dependencies. `srcdiff.py --mode tex` reuses `paper2md`'s own stripping primitives, so it needs nothing `paper2md.py` does not already.
 
@@ -58,7 +59,7 @@ python3 pdfpages.py paper.pdf --pages 1-6 --dpi 200 -o pages/     # read these
 python3 pdfpages.py paper.pdf --pages 4 --band 0.22-0.40 --dpi 400 -o pages/
 ```
 
-Render the whole page to read it, then re-render a `--band` slice at 400 dpi wherever a subscript or a sign is not certain — guessing at 200 dpi is how a transcription acquires errors that nothing downstream will catch. Transcribe as printed and never silently correct the authors' own typos; a scan is old enough that it usually has some. Then verify with `srcdiff.py --mode ocr` (step 5), which on this path is not optional: it is the only check that compares what you wrote against what the paper says.
+Render the whole page to read it, then re-render a `--band` slice at 400 dpi wherever a subscript or a sign is not certain — guessing at 200 dpi is how a transcription acquires errors that nothing downstream will catch. Transcribe as printed and never silently correct the authors' own typos; a scan is old enough that it usually has some. Write a page marker (step 3) at the point each page begins as you go — `<!-- page 7 -->`, with the number printed on the page, never the sheet count — since you are reading page by page anyway and `pagemarks.py` has no text layer to align against here. Then verify with `srcdiff.py --mode ocr` (step 5), which on this path is not optional: it is the only check that compares what you wrote against what the paper says.
 
 Then **compile the paper**, because `.aux` and `.bbl` are what make the conversion exact:
 
@@ -99,6 +100,14 @@ The script inserts a separating space itself wherever expanding a macro would ot
 
 Two things that are *not* options and must never be read as one: a bracket after a macro (`\Tr[\rho]` is an operator applied to a bracketed argument, not `\Tr` with an option) and a bracket after a theorem-like environment (`\begin{lemma}[branches]` prints the lemma's name). Both are now carried through; only `\smashoperator[r]{...}` and an enumitem option list are consumed. An `enumerate` whose option sets `label=(\alph*)` (or `\roman*`, `\Alph*`, …) keeps those printed labels in the Markdown, because the paper's own prose cites them — "Lemma 2.5(a)", "Remark 3.2(iii)" — and a plain `1.` list breaks every one of those references.
 
+**Page markers.** If the compiled PDF sits next to the `.tex` (`paper.pdf` beside `paper.tex`; otherwise pass `--pdf`), the Markdown gets a marker where each printed page begins, carrying the number printed in the page's corner — `1123` in a journal, `iii` in front matter, `S-3` in a supplement — not the sheet count:
+
+```
+… the bound is tight in this case. <!-- page 7 --> The converse fails, as the …
+```
+
+An HTML comment, so it renders as nothing and none of the step 5 checks see it; a page that begins mid-sentence gets it mid-sentence, a page that begins with a new paragraph, heading or display gets it on a line of its own. Find a page with `grep -n -- '<!-- page 7 -->' paper.md` (the closing ` -->` is what keeps page 7 from matching 70–79). Numbers are read off the top and bottom lines of each page and only believed when they go up one per sheet; a page in a numbered run that prints none (an article's first page, a full-page figure) gets its number inferred, and a PDF that prints no numbers at all gets no markers — say so in the report rather than inventing them. Placement aligns the PDF's text layer against the Markdown, so it can be a word early where pdftotext interleaves the last lines of two columns; spot-check two or three markers against the PDF. For a conversion from a text-layer PDF (no `.tex`), run the same thing by hand: `python3 pagemarks.py paper.md --pdf paper.pdf` (re-runnable — it replaces its own markers; `--strip` removes them). `--no-page-numbers` turns it off.
+
 A paper split across files — `\input{preamble}`, `\input{defs.tex}` pulling in the `\newcommand` soup, per-diagram `path.tikz` files loaded via the "tikzit" convention (`\tikzfig{path}`, from `tikzfig.sty`) — is resolved automatically: `\input`/`\include` are inlined recursively, and `\tikzfig`/`\ctikzfig`/`\inlinetikzfig{path}` pulls in `path.tikz` (or `figures/path.tikz`) as a tikzpicture, before anything else runs. Point the script at the *main* file; everything it pulls in is found relative to the file that pulls it in, exactly as pdflatex would. A missing `\input` target is flagged (`input-missing`) rather than silently leaving a gap.
 
 ## 4. Work the flag manifest
@@ -125,6 +134,9 @@ A paper split across files — `\input{preamble}`, `\input{defs.tex}` pulling in
 | `frontmatter-dropped` | a frontmatter command with no heading-block equivalent (`\pacs`, `\keywords`, `\preprint`, or a `\thanks`/`\footnote` inside an author name). The content is in the flag detail — restore it by hand wherever it belongs if the PDF prints it |
 | `frontmatter-duplicate` | `\title`/`\author` given both in the preamble and after `\begin{document}`; the preamble's was kept and the other is in the flag detail — check which one the PDF shows |
 | `table-nested` | a `tabular` inside another `tabular`'s cell. The outer table is emitted in full with a `[nested table — see flags]` marker in that cell; write the inner table out by hand (or inline it, if it is short) |
+| `pdf-stale` | the PDF next to the `.tex` is older than it, so its page breaks may not be the source's — recompile (step 2) and re-run |
+| `page-unmatched` | no text from that page was found in the Markdown (all figure, or blank), so its marker sits with the next page's — check where that page's content actually starts and move the marker by hand |
+| `page-unplaced` | a page at the end of the PDF matched nothing, so it has no marker — usually a page of references or appendix the conversion does not carry; check, and add the marker by hand if its content is there |
 | `accent-unrendered` | an accent construct that produced no character — `\~{}` used as a literal tilde inside a URL is the usual case. Rewrite it by hand |
 | `escaping-regime` | a real defect — a bare `\command` or `_` escaped into text. Fix the cause, not the symptom. A `\command{color}{...}` wrapper (e.g. `\textcolor{blue}{...}`) surviving as literal text is the same class of defect as `--drop-color` handles for `\color{...}` — strip the wrapper, keep the content, note it to the user |
 
@@ -175,4 +187,4 @@ A `tikzpicture` typeset directly inside an `equation`/`align`/`\[...\]` body —
 
 ## Reporting back
 
-Say which source you converted from (and that you checked for `.tex` before settling for a PDF — and, for a PDF, whether it had a text layer at all), that you compiled for `.aux`/`.bbl`, how figures are represented, and the verification results **as counts, not adjectives** — "13 display and 513 inline expressions parse, zero escaping violations, one flag outstanding, `srcdiff` clean in both directions". If you did not run the source comparison, say that instead of implying the checks that did run covered it. Flag any normalisation applied to the author's own text, with source line numbers, and never silently fix their typos.
+Say which source you converted from (and that you checked for `.tex` before settling for a PDF — and, for a PDF, whether it had a text layer at all), that you compiled for `.aux`/`.bbl`, how figures are represented, whether page markers went in (how many, and whether the PDF printed numbers at all), and the verification results **as counts, not adjectives** — "13 display and 513 inline expressions parse, zero escaping violations, one flag outstanding, `srcdiff` clean in both directions". If you did not run the source comparison, say that instead of implying the checks that did run covered it. Flag any normalisation applied to the author's own text, with source line numbers, and never silently fix their typos.

@@ -2473,6 +2473,48 @@ def run_checks(md):
     return len(viol)
 
 # --------------------------------------------------------------------------
+# page markers
+# --------------------------------------------------------------------------
+
+def add_page_markers(md, pdf, tex):
+    """Mark where each printed page of the compiled PDF begins (pagemarks.py).
+
+    Returns (md, one-line note). Never fails the conversion: without
+    pdftotext/pypdf, or with nothing printed, the Markdown is returned as is
+    and the note says why."""
+    try:
+        import pagemarks
+    except ImportError as exc:                        # pragma: no cover
+        return md, f"page markers: skipped ({exc})"
+    if os.path.exists(tex) and os.path.getmtime(pdf) < os.path.getmtime(tex):
+        flag("pdf-stale",
+             f"{os.path.basename(pdf)} is older than {os.path.basename(tex)}: its "
+             "page breaks may not be the source's. Recompile and re-run.")
+    try:
+        new, report = pagemarks.annotate(md, pdf)
+    except pagemarks.Unavailable as exc:
+        return md, f"page markers: skipped ({exc})"
+    if report["source"] is None:
+        return md, (f"page markers: none ({os.path.basename(pdf)} prints no page "
+                    "numbers)")
+    for r in report["pages"]:
+        if r["label"] is None:
+            continue
+        if r["placed"] == "no":
+            flag("page-unplaced",
+                 f"page {r['label']} (PDF sheet {r['sheet']}): none of its text was "
+                 "found after the previous page's marker, so it has no marker.")
+        elif r["placed"] == "unmatched":
+            flag("page-unmatched",
+                 f"page {r['label']} (PDF sheet {r['sheet']}): none of its text "
+                 "matched; its marker was put with the next page's.", "",
+                 r["line"])
+    n = sum(1 for r in report["pages"] if r["line"])
+    return new, (f"page markers: {n} ({report['source']} page numbers from "
+                 f"{os.path.basename(pdf)}; grep '<!-- page N -->')")
+
+
+# --------------------------------------------------------------------------
 # main
 # --------------------------------------------------------------------------
 
@@ -2495,6 +2537,11 @@ def main():
     ap.add_argument("--macro-override-math", action="append", default=[],
                     metavar="NAME=REPLACEMENT",
                     help="expansion to use INSIDE math (e.g. flip='\\mathtt{ancS}\\to\\mathtt{chM}')")
+    ap.add_argument("--pdf", default=None,
+                    help="the compiled PDF, for page markers carrying the paper's "
+                         "printed page numbers (default: <stem>.pdf if present)")
+    ap.add_argument("--no-page-numbers", action="store_true",
+                    help="do not add page markers even if a PDF is found")
     a = ap.parse_args()
     a.style_map = dict(p.split("=", 1) for p in a.styles.split(",") if "=" in p)
 
@@ -2634,6 +2681,12 @@ def main():
     # whose placeholders restored after it was built collects them.
     md = re.sub(r"[ \t]+$", "", md, flags=re.M)
     md = re.sub(r"(?:^>\n){2,}", ">\n", md, flags=re.M)
+    page_note = None
+    pdf = None if a.no_page_numbers else (
+        a.pdf or (stem + ".pdf" if os.path.exists(stem + ".pdf") else None))
+    if pdf:
+        md, page_note = add_page_markers(md, pdf, a.tex)
+
     out = a.out or (stem + ".md")
     open(out, "w", encoding="utf-8").write(md)
 
@@ -2647,6 +2700,8 @@ def main():
     print(f"wrote {out}  ({len(md)} bytes)")
     print(f"wrote {fl}  ({len(FLAGS)} flags)")
     print(f"escaping-regime violations: {nviol}")
+    if page_note:
+        print(page_note)
     if by_kind:
         print("\nflags by kind:")
         for k, v in sorted(by_kind.items(), key=lambda x: -x[1]):
