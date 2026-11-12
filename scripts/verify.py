@@ -46,11 +46,17 @@ except ImportError:                                   # pragma: no cover
 FENCE_RE = re.compile(r"```[\s\S]*?```")
 DISP_RE = re.compile(r"\$\$[\s\S]*?\$\$")
 INLINE_RE = re.compile(r"\$[^$\n]+?\$")
+# HTML comments render as nothing. pagemarks.py puts one wherever a printed
+# page begins -- mid-sentence if that is where it begins -- and left in, it
+# splits a reference in two: "Table 1 of Schmid, <!-- page 2 --> Rosset [1]".
+HTML_COMMENT_RE = re.compile(r"<!--[\s\S]*?-->")
 
 
 def prose_only(md):
-    """Markdown with fences and math removed, for scanning cross-references."""
-    s = FENCE_RE.sub(" ", md)
+    """Markdown with comments, fences and math removed, for scanning
+    cross-references."""
+    s = HTML_COMMENT_RE.sub(" ", md)
+    s = FENCE_RE.sub(" ", s)
     s = DISP_RE.sub(" ", s)
     s = INLINE_RE.sub(" ", s)
     return s

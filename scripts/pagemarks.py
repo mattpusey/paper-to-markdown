@@ -120,6 +120,16 @@ class Unavailable(Exception):
 # the marker
 # --------------------------------------------------------------------------
 
+def clean_label(label):
+    """A label as a marker can carry it. Printed numbers never contain spaces,
+    but an explicit /PageLabels entry can ("Appendix 1"). Runs of whitespace
+    become one space, and "--" is broken up so it cannot end the comment."""
+    label = " ".join(str(label).split())
+    while "--" in label:
+        label = label.replace("--", "-")
+    return label or None
+
+
 def marker(label):
     return f"<!-- page {label} -->"
 
@@ -127,10 +137,12 @@ def marker(label):
 # Exactly the three shapes insert() writes, so stripping restores the text
 # byte for byte: a block marker on its own line (indented to match a list
 # item), an inline one before a word, an inline one at the end of a line.
-_STRIP_BLOCK_RE = re.compile(r"^[ \t]*<!-- page \S+ -->\n\n", re.M)
-_STRIP_BEFORE_RE = re.compile(r"<!-- page \S+ --> ")
-_STRIP_AFTER_RE = re.compile(r" <!-- page \S+ -->")
-MARKER_RE = re.compile(r"<!-- page (\S+) -->")
+# A label may hold single spaces ("Appendix 1"), never a newline or "--".
+_LABEL = r"(?:[^\s-]|-(?!-)| (?!-->))+"
+_STRIP_BLOCK_RE = re.compile(r"^[ \t]*<!-- page %s -->\n\n" % _LABEL, re.M)
+_STRIP_BEFORE_RE = re.compile(r"<!-- page %s --> " % _LABEL)
+_STRIP_AFTER_RE = re.compile(r" <!-- page %s -->" % _LABEL)
+MARKER_RE = re.compile(r"<!-- page (%s) -->" % _LABEL)
 
 
 def strip_markers(md):
@@ -167,7 +179,11 @@ def read_pdf(path):
     except ImportError:
         raise Unavailable("needs pdftotext on PATH or pypdf installed "
                           "(pip install pypdf)")
-    pages = [(p.extract_text() or "") for p in pypdf.PdfReader(path).pages]
+    try:
+        pages = [(p.extract_text() or "") for p in pypdf.PdfReader(path).pages]
+    except Exception as exc:          # corrupt, encrypted, truncated, ...
+        raise Unavailable(f"cannot read {os.path.basename(path)}: "
+                          f"{type(exc).__name__}: {exc}")
     return pages, pages
 
 
@@ -300,8 +316,16 @@ def detect_labels(layout_pages):
             run = (scheme, value - i)
             votes[run] += w
             pages_for[run].add(i)
+    # A run needs two pages, or its single page in a one-page PDF; and then
+    # either one page printing the number on a line of its own (weight 3), or
+    # support from at least half the PDF. The second is what lets a two-page
+    # paper numbered only in its running heads ("012345-1  SMITH AND JONES")
+    # through, without letting two pages of section numbers in the heads of a
+    # twenty-page paper pass for page numbers.
     need = 2 if n > 1 else 1
-    good = {r for r in votes if len(pages_for[r]) >= need and votes[r] >= 3}
+    good = {r for r in votes
+            if len(pages_for[r]) >= need
+            and (votes[r] >= 3 or len(pages_for[r]) >= max(2, n // 2))}
 
     labels, how, runs, texts = [None] * n, [None] * n, [None] * n, [None] * n
     for i, cs in enumerate(cands):
@@ -455,73 +479,87 @@ def align(src, src_page, md):
 # placement
 # --------------------------------------------------------------------------
 
-def drop_label_lines(text, label):
-    """Remove the head or foot line that carries the page's own number.
-
-    strip_running_lines only knows a running head by its repeating, and a
-    head that names the current section ("103  SECTION 2 ABOUT X") changes
-    from section to section. Knowing the printed number, the line is found
-    without guessing -- and with it gone, the page's first words really are
-    its first words."""
-    if not label:
-        return text
-    lines = text.split("\n")
-    nonblank = [k for k, l in enumerate(lines) if l.strip()]
-    edge = set(nonblank[:3] + nonblank[-3:])
-    keep = []
-    for k, line in enumerate(lines):
-        toks = line.split()
-        if k in edge and toks and label in (toks[0], toks[-1]) \
-                and len(" ".join(toks)) <= 120:
-            continue
-        keep.append(line)
-    return "\n".join(keep)
-
-
+_TAIL_HYPHEN_RE = re.compile(r"([^\W\d_]{2})-\s*$")
 # pdftotext's reading-order mode has already removed the hyphen and glued on
 # the next line -- which at the foot of a page is the page number: "zy102".
-_TAIL_HYPHEN_RE = re.compile(r"([^\W\d_]{2})(?:-|\d{1,5})\s*$")
+# Only the page's own number counts as that glue: "E mc2" is an equation.
+_TAIL_GLUED_RE = re.compile(r"([^\W\d_]{2})(\d{1,5})\s*$")
 _HEAD_FRAGMENT_RE = re.compile(r"^\s*([^\W\d_]+)")
 
 
-def _is_furniture(line):
-    """A line with no lowercase letter at the very top or bottom of a page is
-    a page number or an all-caps running head ("SECTION 5 ABOUT ARGUMENT"),
-    which in reading order can sit between a hyphenated word's two halves."""
+def _is_uppercase(line):
     return not any(c.islower() for c in line)
 
 
-def _skip_furniture(lines, reverse=False):
+def _is_number_line(line):
+    return bool(re.fullmatch(r"[\W\d_]*\d[\W\d_]*", line.strip()))
+
+
+def _edge_order(lines, reverse):
     order = range(len(lines) - 1, -1, -1) if reverse else range(len(lines))
-    seen = 0
-    for k in order:
-        if not lines[k].strip():
-            continue
-        if _is_furniture(lines[k]) and seen < 3:
-            seen += 1
-            continue
-        return k
+    return [k for k in order if lines[k].strip()]
+
+
+def _skip_furniture(lines, reverse=False):
+    """The first line, from the top or (reverse) the bottom, past up to three
+    lines with no lowercase letter. For locating a hyphenated word's halves
+    only -- nothing is deleted on this basis."""
+    edge = _edge_order(lines, reverse)
+    for n, k in enumerate(edge):
+        if n >= 3 or not _is_uppercase(lines[k]):
+            return k
     return None
 
 
-def strip_furniture(text):
-    """Drop page numbers and all-caps running heads from the top and bottom
-    of a page. Left in, they are unmatched text at the edge of the page --
-    exactly the signal place() reads to decide which side of an equation a
-    page boundary falls."""
+def furniture_lines(layout_text, label):
+    """The page's head and foot as the layout shows them: the edge lines
+    that carry the page's own printed number ("5   SECTION 5 ABOUT X   106",
+    "Accepted in Quantum ... CC-BY 4.0.   9"). Layout keeps a running head on
+    one line with its number; reading order often does not."""
+    if not label:
+        return []
+    lines = [" ".join(l.split()) for l in layout_text.splitlines() if l.strip()]
+    out = []
+    for line in lines[:3] + lines[-3:]:
+        toks = line.split()
+        if label in (toks[0], toks[-1]) and len(line) <= 120 and line not in out:
+            out.append(line)
+    return out
+
+
+def strip_furniture(text, furniture=()):
+    """Drop page numbers and running heads and feet from the top and bottom
+    of a page's reading-order text. Left in, they are unmatched text at the
+    edge of the page -- exactly the signal place() reads to decide which
+    side of an equation a page boundary falls.
+
+    An edge line goes if it is a bare number, or if every word of it is in
+    a line that `furniture_lines` found beside the printed page number. Only
+    that: a heading that opens a page ("RESULTS") is text the Markdown has
+    too, and stays, however much it looks like a running head. strip_running_lines
+    still takes heads that repeat from page to page without a number."""
     lines = text.split("\n")
-    top = _skip_furniture(lines)
-    if top is None:
-        return ""
-    bottom = _skip_furniture(lines, reverse=True)
-    return "\n".join(lines[top:bottom + 1])
+    furn = [set(f.split()) for f in furniture]
+    edge = _edge_order(lines, False)[:3] + _edge_order(lines, True)[:3]
+    drop = set()
+    for k in edge:
+        toks = lines[k].split()
+        if _is_number_line(lines[k]) or any(set(toks) <= f for f in furn):
+            drop.add(k)
+    return "\n".join(l for k, l in enumerate(lines) if k not in drop)
 
 
-def rejoin_across_pages(pages):
+def rejoin_across_pages(pages, labels=None, vocab=None):
     """A word hyphenated over a page break belongs to the page it starts on:
     "zy-" ending one page and "dase relation" opening the next become
     "zydase" and "relation". Left split, the boundary lands inside the word
-    on some pages and before it on others."""
+    on some pages and before it on others.
+
+    The second half is not always on the next page's first line: in reading
+    order that page can open with its other column ("5 Section 5 about
+    ..."). Given the Markdown's vocabulary, the first line in the page's
+    opening dozen that starts with a lowercase fragment completing a word the
+    Markdown has is taken; without one, only the first line is tried."""
     pages = list(pages)
     for p in range(1, len(pages)):
         before, after = pages[p - 1].split("\n"), pages[p].split("\n")
@@ -529,11 +567,26 @@ def rejoin_across_pages(pages):
         if kb is None or ka is None:
             continue
         tail = _TAIL_HYPHEN_RE.search(before[kb])
-        head = _HEAD_FRAGMENT_RE.match(after[ka])
-        if tail and head and head.group(1)[0].islower():
+        if not tail and labels and labels[p - 1]:
+            glued = _TAIL_GLUED_RE.search(before[kb])
+            if glued and glued.group(2) == labels[p - 1]:
+                tail = glued
+        if not tail:
+            continue
+        lines = [ka] if vocab is None else \
+            [k for k in range(ka, len(after)) if after[k].strip()][:12]
+        for k in lines:
+            head = _HEAD_FRAGMENT_RE.match(after[k])
+            if not head or not head.group(1)[0].islower():
+                continue
+            first = re.search(r"[^\W\d_]+$", before[kb][:tail.end(1)]).group(0)
+            word = srcdiff.fold(first + head.group(1))
+            if vocab is not None and word not in vocab:
+                continue
             before[kb] = before[kb][:tail.end(1)] + head.group(1)
-            after[ka] = after[ka][head.end():]
+            after[k] = after[k][head.end():]
             pages[p - 1], pages[p] = "\n".join(before), "\n".join(after)
+            break
     return pages
 
 
@@ -577,16 +630,18 @@ def _gap_bag(words):
     return collections.Counter(w for w in words if len(w) >= 2)
 
 
-def place(md, flow_pages, labels):
+def place(md, flow_pages, labels, layout_pages=None):
     """[(offset, how) or None] for each PDF page, in page order."""
     masked = mask_markdown(md)
     mwords, mstarts, mends = markdown_words(masked)
     blocks = block_starts(masked)
 
     src, src_page, page_lo = [], [], []
-    stripped = [strip_furniture(drop_label_lines(t, l))
-                for t, l in zip(flow_pages, labels)]
-    stripped = rejoin_across_pages(srcdiff.strip_running_lines(stripped))
+    layout_pages = layout_pages or [""] * len(flow_pages)
+    stripped = [strip_furniture(t, furniture_lines(lay, l))
+                for t, lay, l in zip(flow_pages, layout_pages, labels)]
+    stripped = rejoin_across_pages(srcdiff.strip_running_lines(stripped), labels,
+                                   set(mwords))
     for p, text in enumerate(stripped):
         page_lo.append(len(src))
         toks = _WORD_RE.findall(srcdiff.fold(srcdiff.dehyphenate(text)))
@@ -729,6 +784,7 @@ def insert(md, placed, labels):
 
 def annotate(md, pdf_path):
     """(new_md, report). Raises Unavailable if the PDF cannot be read."""
+    old = len(MARKER_RE.findall(md))
     md = strip_markers(md)
     layout, flow = read_pdf(pdf_path)
     if sum(len(p.strip()) for p in flow) < 50 * max(1, len(flow)):
@@ -739,14 +795,15 @@ def annotate(md, pdf_path):
     if not any(labels):
         explicit = pdf_page_labels(pdf_path)
         if explicit and len(explicit) == len(flow):
-            labels, how, source = explicit, ["PDF /PageLabels"] * len(flow), "pdf-labels"
+            labels = [clean_label(l) for l in explicit]
+            how, source = ["PDF /PageLabels"] * len(flow), "pdf-labels"
     report = {"pdf": pdf_path, "sheets": len(flow), "source": source,
-              "pages": []}
+              "pages": [], "removed": old}
     if not any(labels):
         report["source"] = None
         return md, report
 
-    placed = place(md, flow, labels)
+    placed = place(md, flow, labels, layout)
     new = insert(md, placed, labels)
 
     line_of = {}
@@ -765,7 +822,9 @@ def print_report(report, out_path):
     if report["source"] is None:
         print(f"pagemarks: no printed page numbers found in {report['pdf']} "
               f"({report['sheets']} sheets) and no explicit PDF page labels; "
-              "no markers written")
+              "no markers written"
+              + (f" ({report['removed']} from an earlier run removed)"
+                 if report.get("removed") else ""))
         return
     n = sum(1 for r in report["pages"] if r["line"])
     print(f"pagemarks: {n} page markers written to {out_path} "
@@ -818,7 +877,9 @@ def main():
         new, report = annotate(md, a.pdf)
     except Unavailable as exc:
         ap.exit(2, f"pagemarks: {exc}\n")
-    if not a.dry_run and report["source"] is not None:
+    # Written even when nothing was found: annotate() has removed any markers
+    # an earlier run left, and with nothing printed they no longer apply.
+    if not a.dry_run:
         with open(out, "w", encoding="utf-8") as fh:
             fh.write(new)
     print_report(report, out if not a.dry_run else "(dry run)")

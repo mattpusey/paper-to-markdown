@@ -54,8 +54,15 @@ try:
     from pylatexenc.latexwalker import (LatexWalker, LatexCommentNode,
                                         LatexEnvironmentNode, LatexGroupNode,
                                         LatexMathNode)
-except ImportError:                                   # pragma: no cover
-    sys.exit("paper2md.py needs pylatexenc (pip install pylatexenc)")
+except ImportError as _exc:                           # pragma: no cover
+    # Run as a script, say what to install and stop. Imported -- by verify.py,
+    # srcdiff.py, and through them pagemarks.py, all of which have work to do
+    # on a PDF without it -- raise, so their `except ImportError` fallbacks
+    # actually get the chance to run.
+    if __name__ == "__main__":
+        sys.exit("paper2md.py needs pylatexenc (pip install pylatexenc)")
+    raise ImportError("paper2md.py needs pylatexenc "
+                      "(pip install pylatexenc)") from _exc
 
 # --------------------------------------------------------------------------
 # flags
@@ -2486,6 +2493,8 @@ def add_page_markers(md, pdf, tex):
         import pagemarks
     except ImportError as exc:                        # pragma: no cover
         return md, f"page markers: skipped ({exc})"
+    if not os.path.isfile(pdf):
+        return md, f"page markers: skipped (no such file: {pdf})"
     if os.path.exists(tex) and os.path.getmtime(pdf) < os.path.getmtime(tex):
         flag("pdf-stale",
              f"{os.path.basename(pdf)} is older than {os.path.basename(tex)}: its "

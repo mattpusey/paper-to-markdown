@@ -217,7 +217,8 @@ class Placement(unittest.TestCase):
         # reading-order mode has already dropped the hyphen and glued on the
         # page number; an all-caps running head sits between the halves
         pages = pagemarks.rejoin_across_pages(
-            ["causal value zy102\n", "SECTION 2 ABOUT X\n\ndase relation"])
+            ["causal value zy102\n", "SECTION 2 ABOUT X\n\ndase relation"],
+            ["102", "103"])
         self.assertTrue(pages[0].rstrip().endswith("zydase"))
 
 
@@ -250,6 +251,169 @@ class Placement(unittest.TestCase):
         out = pagemarks.insert(md, pagemarks.place(md, flow, ["4", "5"]),
                                ["4", "5"])
         self.assertIn("$$\n\n<!-- page 5 -->\n\nClearly", out)
+
+
+class ReviewFixes(unittest.TestCase):
+    """One test per defect raised in review of PR #9."""
+
+    def test_runs_without_pylatexenc(self):
+        """srcdiff -> verify -> paper2md, whose missing-pylatexenc handler
+        called sys.exit() at import, so a PDF-only install could not even
+        print pagemarks.py --help. Imported, paper2md now raises ImportError,
+        which verify and srcdiff already catch."""
+        tmp = tempfile.mkdtemp()
+        md = os.path.join(tmp, "x.md")
+        with open(md, "w") as fh:
+            fh.write("Some text <!-- page 3 --> more text.\n")
+        block = ("import sys, runpy; sys.modules['pylatexenc'] = None; "
+                 "sys.argv = %r; runpy.run_path(%r, run_name='__main__')")
+        script = os.path.join(HERE, "pagemarks.py")
+        for argv in (["pagemarks.py", "--help"], ["pagemarks.py", md, "--strip"]):
+            r = subprocess.run([sys.executable, "-c", block % (argv, script)],
+                               capture_output=True, text=True)
+            self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        with open(md) as fh:
+            self.assertEqual(fh.read(), "Some text more text.\n")
+        # and run as a script, paper2md still says what to install
+        r = subprocess.run([sys.executable, "-c", block % (
+            ["paper2md.py", "x.tex"], os.path.join(HERE, "paper2md.py"))],
+            capture_output=True, text=True)
+        self.assertIn("needs pylatexenc", r.stderr)
+        shutil.rmtree(tmp)
+
+    def test_labels_with_spaces_round_trip(self):
+        """An explicit /PageLabels entry can be "Appendix 1". The marker
+        patterns allowed no spaces, so --strip left it behind, the report
+        missed it and a rerun duplicated it."""
+        md = "w " * 10
+        out = pagemarks.insert(md, [(0, "matched"), (4, "matched")],
+                               ["Appendix 1", "Appendix 2"])
+        self.assertEqual(pagemarks.MARKER_RE.findall(out),
+                         ["Appendix 1", "Appendix 2"])
+        self.assertEqual(pagemarks.strip_markers(out), md)
+        self.assertEqual(pagemarks.clean_label("A  --> b"), "A -> b")
+
+    def test_unreadable_pdf_is_unavailable(self):
+        """A corrupt PDF raised pypdf's own exception, which paper2md does
+        not catch, so optional page numbering aborted the whole conversion."""
+        bad = os.path.join(tempfile.mkdtemp(), "bad.pdf")
+        with open(bad, "wb") as fh:
+            fh.write(b"%PDF-1.4 truncated")
+        with self.assertRaises(pagemarks.Unavailable):
+            pagemarks.annotate("text\n", bad)
+
+    def test_two_page_paper_numbered_in_running_heads(self):
+        """Two pages, each with its number at one end of a running head:
+        weight 1 + 1 fell short of the threshold of 3, so a consistent
+        sequence was reported as no page numbers at all."""
+        pages = [page(BODY, head=f"012345-{i + 1}   SMITH AND JONES")
+                 for i in range(2)]
+        self.assertEqual(pagemarks.detect_labels(pages)[0],
+                         ["012345-1", "012345-2"])
+
+    def test_section_numbers_in_a_few_heads_are_not_page_numbers(self):
+        # ...while two pages of a twenty-page paper whose heads happen to go
+        # up by one (a section number) still do not make a page numbering
+        pages = [page(BODY) for _ in range(20)]
+        pages[6] = page(BODY, head="3   SECTION THREE")
+        pages[7] = page(BODY, head="4   SECTION FOUR")
+        self.assertEqual(pagemarks.detect_labels(pages)[0], [None] * 20)
+
+    def test_equation_digits_are_not_page_number_glue(self):
+        """"E mc2" ending a page and "where observers" opening the next were
+        joined into "mcwhere": any trailing digits were taken for a page
+        number glued on in place of a hyphen. Only the page's own number is."""
+        pages = pagemarks.rejoin_across_pages(
+            ["the energy E mc2\n", "where observers measure"], ["7", "8"])
+        self.assertEqual(pages, ["the energy E mc2\n", "where observers measure"])
+        pages = pagemarks.rejoin_across_pages(
+            ["causal value zy7\n", "dase relation"], ["7", "8"])
+        self.assertTrue(pages[0].rstrip().endswith("zydase"))
+
+    def test_second_half_of_a_split_word_found_past_the_other_column(self):
+        # reading order opens the page with its right column's heading; the
+        # rest of "communi-" is on a later line, and the whole word decides
+        pages = pagemarks.rejoin_across_pages(
+            ["we need communi-\n", "5 Section 5 about it\n\ncation here"],
+            ["4", "5"], {"communication", "here", "section", "about"})
+        self.assertTrue(pages[0].rstrip().endswith("communication"))
+        self.assertIn("Section 5 about it", pages[1])
+        self.assertNotIn("cation", pages[1])
+
+    def test_uppercase_heading_opening_a_page_is_kept(self):
+        """Every line without a lowercase letter at a page's edge was taken
+        for a running head, so a page opening on "RESULTS" lost it, and the
+        marker went in after the heading."""
+        self.assertIn("RESULTS",
+                      pagemarks.strip_furniture("RESULTS\n\nWe find the bound."))
+        # A running head goes: the layout shows it on one line with the page
+        # number, though reading order splits it up (and here loses the 106).
+        layout = "5     SECTION 5 ABOUT ARGUMENT        106\n\nRESULTS\n\nWe find."
+        flow = "5\n\nSECTION 5 ABOUT ARGUMENT\n\nRESULTS\n\nWe find."
+        kept = pagemarks.strip_furniture(
+            flow, pagemarks.furniture_lines(layout, "106"))
+        self.assertNotIn("ARGUMENT", kept)
+        self.assertIn("RESULTS", kept)
+
+        a, b = unique_words(60, 12), unique_words(60, 13)
+        md = " ".join(a) + "\n\n## RESULTS\n\n" + " ".join(b) + "\n"
+        flow = [" ".join(a), "RESULTS\n\n" + " ".join(b)]
+        out = pagemarks.insert(md, pagemarks.place(md, flow, ["1", "2"]),
+                               ["1", "2"])
+        self.assertIn("<!-- page 2 -->\n\n## RESULTS", out)
+
+    def test_marker_inside_a_reference_does_not_break_verify(self):
+        """verify.prose_only kept HTML comments, so a marker between "Table 1
+        of Schmid," and "Rosset [1]" broke the cited-elsewhere exemption and
+        reported Table 1 as missing."""
+        import verify
+        md = ("Compare Table 1 of Schmid, <!-- page 2 --> Rosset and "
+              "Buscemi [1], and Fig. <!-- page 3 --> 2 there.\n\n"
+              "**Figure 2:** a caption.\n\n## References\n\n[1] X.\n")
+        res, ok = verify.check_floats(md)
+        self.assertTrue(ok, res)
+        self.assertTrue(verify.check_citations(md)[1])
+
+    def test_rerun_with_no_numbers_removes_old_markers(self):
+        """With no page numbers found, the stripped Markdown was discarded:
+        markers from an earlier run stayed in place, and -o wrote nothing."""
+        tmp = tempfile.mkdtemp()
+        md, out = os.path.join(tmp, "x.md"), os.path.join(tmp, "out.md")
+        with open(md, "w") as fh:
+            fh.write("Text <!-- page 3 --> more text.\n")
+        real = pagemarks.annotate
+        pagemarks.annotate = lambda m, pdf: (
+            pagemarks.strip_markers(m),
+            {"pdf": pdf, "sheets": 1, "source": None, "pages": [], "removed": 1})
+        argv = sys.argv
+        try:
+            pdf = os.path.join(tmp, "x.pdf")
+            open(pdf, "wb").close()
+            sys.argv = ["pagemarks.py", md, "--pdf", pdf, "-o", out]
+            import contextlib, io
+            with contextlib.redirect_stdout(io.StringIO()):
+                pagemarks.main()
+        finally:
+            pagemarks.annotate, sys.argv = real, argv
+        with open(out) as fh:
+            self.assertEqual(fh.read(), "Text more text.\n")
+        shutil.rmtree(tmp)
+
+    def test_missing_pdf_does_not_abort_conversion(self):
+        """An explicit --pdf that does not exist reached os.path.getmtime()
+        and aborted the conversion before the Markdown was written."""
+        tmp = tempfile.mkdtemp()
+        tex = os.path.join(tmp, "p.tex")
+        with open(tex, "w") as fh:
+            fh.write("\\documentclass{article}\\begin{document}Hello."
+                     "\\end{document}\n")
+        r = subprocess.run([sys.executable, os.path.join(HERE, "paper2md.py"),
+                            tex, "--pdf", os.path.join(tmp, "nope.pdf")],
+                           capture_output=True, text=True, cwd=tmp)
+        self.assertEqual(r.returncode, 0, r.stderr[-300:])
+        self.assertIn("page markers: skipped (no such file", r.stdout)
+        self.assertTrue(os.path.exists(os.path.join(tmp, "p.md")))
+        shutil.rmtree(tmp)
 
 
 @unittest.skipUnless(shutil.which("pdflatex") and shutil.which("pdftotext"),
